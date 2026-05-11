@@ -1,0 +1,75 @@
+const items = $input.all();
+
+let webhook = {};
+try {
+  webhook = $items("Start Webhook1")[0].json;
+} catch (e) {
+  // Fallback if not executed
+}
+
+let dedup = {};
+try {
+  let dedupItems = $items("Deduplicate Opportunities");
+  if (dedupItems && dedupItems.length > 0) {
+    dedup = dedupItems[0].json || {};
+  }
+} catch (e) {
+  // Graceful fallback if Deduplicate Opportunities hasn't executed
+}
+
+const contactId = webhook?.body?.contact_id;
+const locationId = webhook?.body?.location?.id;
+const token = webhook?.body?.customData?.apiKey;
+const oppId = webhook?.body?.customData?.opportunityId || dedup?.id;
+
+if (!locationId) throw new Error("Webhook missing location.id");
+if (!token) throw new Error("Webhook missing customData.apiKey");
+
+const fieldIdsOpp = {};
+const fieldIdsContact = {};
+
+for (const item of items) {
+  const row = item.json;
+
+  const friendly = row["Friendly Name"];
+  const key = row["Field Keys"];
+
+  // Skip rows that don't contain actual mappings
+  if (!friendly || !key) continue;
+
+  // Skip your section marker rows like: const PREQUAL_OPP = {
+  if (String(friendly).startsWith("const ")) continue;
+
+  const fieldId = row[locationId];
+  if (!fieldId) continue;
+
+  const id = String(fieldId).trim();
+  const k = String(key).trim();
+
+  if (k.startsWith("opportunity.")) {
+    fieldIdsOpp[friendly] = id;
+  } else if (k.startsWith("contact.")) {
+    fieldIdsContact[friendly] = id;
+  }
+}
+
+if (Object.keys(fieldIdsOpp).length === 0 && Object.keys(fieldIdsContact).length === 0) {
+  const headers = Object.keys(items[0]?.json || {}).join(", ");
+  throw new Error(
+    `No field IDs found for locationId=${locationId}. ` +
+    `Make sure Tab2 has a column header exactly equal to the locationId. Headers seen: ${headers}`
+  );
+}
+
+return [
+  {
+    json: {
+      oppId,
+      contactId,
+      locationId,
+      token,
+      fieldIdsOpp,
+      fieldIdsContact
+    }
+  }
+];
