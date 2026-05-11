@@ -1,0 +1,716 @@
+
+
+// ==========================================
+// NORMALIZE SUBJECT + MODE v3
+// Strict opportunity-authoritative edition
+// ==========================================
+
+// ==========================================
+// 1. HELPER FUNCTIONS
+// ==========================================
+function firstNonEmpty(...vals) {
+  for (const v of vals) {
+    if (v === 0) return 0;
+    if (v === false) return false;
+    if (v == null) continue;
+
+    if (typeof v === 'string') {
+      const trimmed = v.trim();
+      if (trimmed !== '' && trimmed.toLowerCase() !== 'empty') return trimmed;
+    } else {
+      return v;
+    }
+  }
+  return null;
+}
+
+function parseMoney(x) {
+  if (x == null || x === '') return null;
+  if (typeof x === 'number') return Number.isFinite(x) ? x : null;
+  const n = parseFloat(String(x).replace(/[^\d.-]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseNum(x) {
+  if (x == null || x === '') return null;
+  if (typeof x === 'number') return Number.isFinite(x) ? x : null;
+  const n = parseFloat(String(x).replace(/[^\d.-]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+function cleanSpaces(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
+function normalizeZip(zip) {
+  const s = cleanSpaces(zip);
+  const m = s.match(/^(\d{5})(?:-\d{4})?$/);
+  return m ? m[1] : s;
+}
+
+function hasUnitMarker(address) {
+  const s = cleanSpaces(address).toLowerCase();
+  return /(?:\b(?:apt|apartment|unit|ste|suite)\b|#)\s*[a-z0-9-]+\b/.test(s);
+}
+
+function stripUnit(address) {
+  return cleanSpaces(address)
+    .replace(/(?:\b(?:apt|apartment|unit|ste|suite)\b|#)\s*[a-z0-9-]+\b/ig, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function parseStreetFromOppName(name) {
+  const s = cleanSpaces(name);
+  if (!s.includes('-')) return '';
+  return s.split('-').slice(1).join('-').trim();
+}
+
+function toBoolLike(v) {
+  const s = cleanSpaces(v).toLowerCase();
+  if (!s) return null;
+  if (['yes', 'y', 'true', '1'].includes(s)) return true;
+  if (['no', 'n', 'false', '0'].includes(s)) return false;
+  return null;
+}
+
+function toPct(v) {
+  const n = parseNum(v);
+  if (n == null) return null;
+  return n <= 1 ? n * 100 : n;
+}
+
+function toRatio(v) {
+  const n = parseNum(v);
+  if (n == null) return null;
+  return n > 1 ? n / 100 : n;
+}
+
+function joinAddress(addressLine, city, state, zip) {
+  return cleanSpaces([addressLine, city, state, zip].filter(Boolean).join(', '));
+}
+
+// RentCast strict property type enforcement
+function canonicalPropertyType(rawPropType, rawHouseStyle, rawPropertyTypeField) {
+  const s = [rawPropType, rawHouseStyle, rawPropertyTypeField]
+    .filter(Boolean)
+    .join(' | ')
+    .toLowerCase();
+
+  if (/(5\+|apartment)/.test(s)) return 'Apartment';
+  if (/(multi|duplex|triplex|quad|fourplex|4-plex|plex|2-4)/.test(s)) return 'Multi-Family';
+
+  if (/(condo|condominium)/.test(s)) return 'Condo';
+  if (/(townhome|townhouse|attached)/.test(s)) return 'Townhouse';
+
+  if (/(manufactured|mobile|modular)/.test(s)) return 'Manufactured';
+  if (/(vacant land|land|vacant)/.test(s)) return 'Land';
+  if (/(commercial|industrial|office|retail)/.test(s)) return 'Commercial';
+
+  return 'Single Family';
+}
+
+function inferUnitCount(propModeStr, notesStr, addressHasUnit, sqft) {
+  const s = String(propModeStr || '').toLowerCase() + ' ' + String(notesStr || '').toLowerCase();
+
+  const explicitMatch = s.match(/(?:(\d+)\s*units?|(?:number of units|units?)[#:\s]+(\d+))/i);
+  if (explicitMatch) {
+    const explicitCount = parseInt(explicitMatch[1] || explicitMatch[2], 10);
+    if (explicitCount > 0) return explicitCount;
+  }
+
+  if (/quad|fourplex|4-plex|4 units|four units/.test(s)) return 4;
+  if (/triplex|3-plex|3 units|three units/.test(s)) return 3;
+  if (/duplex|2-plex|2 units|two units/.test(s)) return 2;
+
+  if (addressHasUnit && sqft >= 2500) return 4;
+  return null;
+}
+
+function amortizedPI(balance, annualRatePct, years = 30) {
+  const P = parseMoney(balance);
+  const rate = parseMoney(annualRatePct);
+  if (!P || !rate || P <= 0 || rate <= 0) return null;
+
+  const r = (rate / 100) / 12;
+  const n = years * 12;
+  return P * ((r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1));
+}
+
+// ==========================================
+// 2. MAIN LOGIC
+// ==========================================
+const webhook = $('Start Webhook1').first().json || {};
+const body = webhook.body || {};
+
+// ONLY customData is authoritative for property/opportunity fields
+const cd = (body.customData && typeof body.customData === 'object') ? body.customData : {};
+
+// IMPORTANT:
+// Only allow body fallback for property fields if this opportunity is explicitly
+// marked as the outreach property.
+const isOutreachPropertyRaw = cleanSpaces(firstNonEmpty(
+  cd['opp.is_outreach_property'],
+  null
+));
+const isOutreachPropertyBool = toBoolLike(isOutreachPropertyRaw) === true;
+const propertyFallback = isOutreachPropertyBool ? body : {};
+
+// ------------------------------------------
+// Opportunity identity
+// ------------------------------------------
+const oppName = cleanSpaces(firstNonEmpty(
+  cd.opportunityName,
+  propertyFallback.opportunity_name,
+  propertyFallback.opportunityName,
+  ''
+));
+
+const parsedOppStreet = parseStreetFromOppName(oppName);
+
+// ------------------------------------------
+// Strict address hierarchy
+// ------------------------------------------
+let rawAddress = cleanSpaces(firstNonEmpty(
+  cd.opportunityAddress,
+  cd.oppStreetAddress,
+  propertyFallback.opportunityAddress,
+  propertyFallback.oppStreetAddress,
+  parsedOppStreet,
+  ''
+));
+
+if (rawAddress && rawAddress.includes(',')) {
+  rawAddress = rawAddress.split(',')[0].trim();
+}
+
+const rawCity = cleanSpaces(firstNonEmpty(
+  cd.city,
+  propertyFallback.city,
+  ''
+));
+
+const rawState = cleanSpaces(firstNonEmpty(
+  cd.state,
+  propertyFallback.state,
+  ''
+)).toUpperCase();
+
+const rawZip = normalizeZip(firstNonEmpty(
+  cd.zip,
+  propertyFallback.zip,
+  propertyFallback.postal_code,
+  ''
+));
+
+// ------------------------------------------
+// Property type / physical attributes
+// ------------------------------------------
+const rawPropType = firstNonEmpty(
+  cd.prop_type,
+  cd['Property Type'],
+  cd['opp.propertyStyle'],
+  propertyFallback.prop_type,
+  propertyFallback['Property Type'],
+  propertyFallback['opp.propertyStyle'],
+  ''
+);
+
+const rawHouseStyle = firstNonEmpty(
+  cd['opp.propertyStyle'],
+  cd.propertyStyle,
+  propertyFallback['opp.propertyStyle'],
+  propertyFallback.propertyStyle,
+  ''
+);
+
+const rawPropertyTypeField = firstNonEmpty(
+  cd['Property Type'],
+  cd.prop_type,
+  cd['opp.propertyStyle'],
+  propertyFallback['Property Type'],
+  propertyFallback.prop_type,
+  propertyFallback['opp.propertyStyle'],
+  ''
+);
+
+const beds = parseNum(firstNonEmpty(
+  cd.beds,
+  propertyFallback.beds,
+  null
+));
+
+const baths = parseNum(firstNonEmpty(
+  cd.baths,
+  propertyFallback.baths,
+  null
+));
+
+const sqft = parseNum(firstNonEmpty(
+  cd.squarefootage,
+  propertyFallback.squarefootage,
+  null
+));
+
+const unitCountExplicit = parseNum(firstNonEmpty(
+  cd['opp.units'],
+  propertyFallback['opp.units'],
+  null
+));
+
+// ------------------------------------------
+// Value / list / tax / status fields
+// ------------------------------------------
+const listPrice = parseMoney(firstNonEmpty(
+  cd['opp.listPrice'],
+  cd.list_price,
+  propertyFallback['opp.listPrice'],
+  propertyFallback.list_price,
+  null
+));
+
+const assessedTotal = parseMoney(firstNonEmpty(
+  cd['opp.assessedTotalValue'],
+  propertyFallback['opp.assessedTotalValue'],
+  null
+));
+
+const estValue = parseMoney(firstNonEmpty(
+  cd['opp.estValue'],
+  cd.estValue,
+  propertyFallback['opp.estValue'],
+  propertyFallback.estValue,
+  null
+));
+
+const estArv = parseMoney(firstNonEmpty(
+  cd['opp.estArv'],
+  cd.estArv,
+  propertyFallback['opp.estArv'],
+  propertyFallback.estArv,
+  null
+));
+
+const lastSaleAmount = parseMoney(firstNonEmpty(
+  cd['opp.lastSaleAmount'],
+  propertyFallback['opp.lastSaleAmount'],
+  null
+));
+
+const yearBuilt = parseNum(firstNonEmpty(
+  cd.yearBuilt,
+  propertyFallback.yearBuilt,
+  null
+));
+
+const lotArea = parseNum(firstNonEmpty(
+  cd['opp.lotArea'],
+  propertyFallback['opp.lotArea'],
+  null
+));
+
+const listStatus = cleanSpaces(firstNonEmpty(
+  cd['opp.listStatus'],
+  cd.listStatus,
+  propertyFallback['opp.listStatus'],
+  propertyFallback.listStatus,
+  null
+));
+
+const mlsListStatus = cleanSpaces(firstNonEmpty(
+  cd['opp.mlsListStatus'],
+  cd.mlsListStatus,
+  propertyFallback['opp.mlsListStatus'],
+  propertyFallback.mlsListStatus,
+  cd['opp.listStatus'],
+  propertyFallback['opp.listStatus'],
+  null
+));
+
+const vacancyFlagRaw = cleanSpaces(firstNonEmpty(
+  cd['opp.vacancy'],
+  cd.vacancy,
+  propertyFallback['opp.vacancy'],
+  propertyFallback.vacancy,
+  null
+));
+
+const ownerOccupiedRaw = cleanSpaces(firstNonEmpty(
+  cd['opp.ownerOccupied'],
+  cd.ownerOccupied,
+  propertyFallback['opp.ownerOccupied'],
+  propertyFallback.ownerOccupied,
+  null
+));
+
+const estEquity = parseMoney(firstNonEmpty(
+  cd['opp.estEquity'],
+  cd.estEquity,
+  propertyFallback['opp.estEquity'],
+  propertyFallback.estEquity,
+  null
+));
+
+const highRentEst = parseMoney(firstNonEmpty(
+  cd.highRentEst,
+  cd['highRentEst'],
+  propertyFallback.highRentEst,
+  propertyFallback['highRentEst'],
+  null
+));
+
+const lowRentEst = parseMoney(firstNonEmpty(
+  cd.lowRentEst,
+  cd['lowRentEst'],
+  propertyFallback.lowRentEst,
+  propertyFallback['lowRentEst'],
+  null
+));
+
+const annualTaxes = parseMoney(firstNonEmpty(
+  cd['annual taxes'],
+  cd['anual taxes'],
+  cd['PQ | Annual Property Taxes'],
+  propertyFallback['annual taxes'],
+  propertyFallback['anual taxes'],
+  propertyFallback['PQ | Annual Property Taxes'],
+  null
+));
+
+const listPctArvPct = toPct(firstNonEmpty(
+  cd['opp.list%Arv'],
+  propertyFallback['opp.list%Arv'],
+  null
+));
+
+const listPctArvRatio = toRatio(firstNonEmpty(
+  cd['opp.list%Arv'],
+  propertyFallback['opp.list%Arv'],
+  null
+));
+
+const listArvSpread = parseMoney(firstNonEmpty(
+  cd['opp.listARVSpread'],
+  propertyFallback['opp.listARVSpread'],
+  null
+));
+
+// ------------------------------------------
+// Loan fields
+// ------------------------------------------
+const rawUwLoan1Balance = firstNonEmpty(
+  cd['Loan 1 Balance'],
+  cd['opp.totalAmountOfOpenLoans'],
+  propertyFallback['Loan 1 Balance'],
+  propertyFallback['opp.totalAmountOfOpenLoans'],
+  null
+);
+
+const rawUwLoan1Monthly = firstNonEmpty(
+  cd['Loan 1 Monthly payment'],
+  propertyFallback['Loan 1 Monthly payment'],
+  null
+);
+
+const rawTotalAmountOfOpen = firstNonEmpty(
+  cd['opp.totalAmountOfOpenLoans'],
+  propertyFallback['opp.totalAmountOfOpenLoans'],
+  null
+);
+
+const rawLoan1Rate = firstNonEmpty(
+  cd['Loan 1 rate'],
+  cd['Loan 1 Rate'],
+  propertyFallback['Loan 1 rate'],
+  propertyFallback['Loan 1 Rate'],
+  null
+);
+
+const rawUwEstMonthly = firstNonEmpty(
+  cd['Uw Est Monthly Payment'],
+  propertyFallback['Uw Est Monthly Payment'],
+  null
+);
+
+const rawOrigPrincipal = firstNonEmpty(
+  cd['loan 1 original principal'],
+  cd['Loan 1 Original Principal'],
+  propertyFallback['loan 1 original principal'],
+  propertyFallback['Loan 1 Original Principal'],
+  null
+);
+
+// ------------------------------------------
+// Transcript
+// ------------------------------------------
+const transcriptA = cleanSpaces(firstNonEmpty(
+  cd.prequalified_phone_transcript,
+  cd.contact_pq_transcript,
+  propertyFallback.prequalified_phone_transcript,
+  propertyFallback.contact_pq_transcript,
+  ''
+));
+
+const precall_mode = !transcriptA;
+
+// ------------------------------------------
+// Core normalized property mode
+// ------------------------------------------
+const addressHasUnit = hasUnitMarker(rawAddress);
+const strippedAddress = stripUnit(rawAddress);
+const propertyType = canonicalPropertyType(rawPropType, rawHouseStyle, rawPropertyTypeField);
+const is_multifamily = propertyType === 'Multi-Family';
+
+// ==========================================
+// NOTE EXTRACTIONS
+// ==========================================
+let extractedRentRoll = null;
+
+const totalRentMatch =
+  transcriptA.match(/\$?([\d,]+(?:\.\d{2})?)\/?mo\s*(?:total)?/i) ||
+  transcriptA.match(/\$?([\d,]+(?:\.\d{2})?)\s*(?:a|per)\s*month/i);
+
+if (totalRentMatch) {
+  extractedRentRoll = parseFloat(totalRentMatch[1].replace(/,/g, ''));
+}
+
+if (!extractedRentRoll) {
+  const rentRegex = /(?:rent roll|gross rent|monthly rent|rents are)[^\d$]*\$?([\d,]+(?:\.\d{2})?)/i;
+  const rentMatch = transcriptA.match(rentRegex);
+  if (rentMatch) {
+    extractedRentRoll = parseFloat(rentMatch[1].replace(/,/g, ''));
+  }
+}
+
+let extractedUnitBeds = null;
+let extractedUnitBaths = null;
+
+const directBedBathMatch = transcriptA.match(/(\d+(?:\.\d)?)\s*beds?\s*\/\s*(\d+(?:\.\d)?)\s*baths?/i);
+if (directBedBathMatch) {
+  extractedUnitBeds = parseFloat(directBedBathMatch[1]);
+  extractedUnitBaths = parseFloat(directBedBathMatch[2]);
+} else {
+  const bedBathMatch = transcriptA.match(/(?:unit beds\/baths|beds\s*\/\s*baths|beds?\/baths?|beds\s*and\s*baths)[^\d]*(\d+(?:\.\d)?)\s*\/\s*(\d+(?:\.\d)?)/i);
+  if (bedBathMatch) {
+    extractedUnitBeds = parseFloat(bedBathMatch[1]);
+    extractedUnitBaths = parseFloat(bedBathMatch[2]);
+  }
+}
+
+// strict unit count logic
+let unit_count = null;
+
+if (!is_multifamily) {
+  unit_count = 1;
+} else if (unitCountExplicit && unitCountExplicit > 0) {
+  unit_count = unitCountExplicit;
+} else {
+  const inferred = inferUnitCount(propertyType, transcriptA, addressHasUnit, sqft);
+  if (inferred) unit_count = inferred;
+}
+
+let building_sqft = sqft || null;
+let unit_sqft = null;
+let building_beds = beds || null;
+let unit_beds = null;
+let building_baths = baths || null;
+let unit_baths = null;
+
+// IMPORTANT:
+// For single family OR any 1-unit property, the "unit" metrics should mirror the building metrics.
+// This keeps rental comp pulls properly constrained.
+if (!is_multifamily || unit_count === 1) {
+  unit_count = 1;
+  unit_sqft = building_sqft;
+  unit_beds = building_beds;
+  unit_baths = building_baths;
+} else if (is_multifamily && unit_count && unit_count > 1) {
+  if (extractedUnitBeds !== null) {
+    unit_beds = extractedUnitBeds;
+    building_beds = Math.round(unit_beds * unit_count);
+  } else {
+    unit_beds = building_beds ? +(building_beds / unit_count).toFixed(2) : null;
+  }
+
+  if (extractedUnitBaths !== null) {
+    unit_baths = extractedUnitBaths;
+    building_baths = Math.round(unit_baths * unit_count);
+  } else {
+    unit_baths = building_baths ? +(building_baths / unit_count).toFixed(2) : null;
+  }
+
+  unit_sqft = building_sqft ? Math.round(building_sqft / unit_count) : null;
+}
+
+// ==========================================
+// LOAN NORMALIZATION
+// ==========================================
+const loan_1_balance = parseMoney(rawUwLoan1Balance);
+let loan_1_monthly_payment = parseMoney(rawUwLoan1Monthly);
+const loan_1_rate = parseMoney(rawLoan1Rate);
+const total_open_loans_amount = parseMoney(rawTotalAmountOfOpen);
+const est_monthly_payment = parseMoney(rawUwEstMonthly);
+const loan_1_original_principal = parseMoney(rawOrigPrincipal);
+
+// calculate missing PI if rate + balance exist
+if (loan_1_balance > 0 && (!loan_1_monthly_payment || loan_1_monthly_payment <= 0) && loan_1_rate > 0) {
+  loan_1_monthly_payment = amortizedPI(loan_1_balance, loan_1_rate, 30);
+}
+
+let loan_status = 'none';
+
+const debtSignalExists =
+  (loan_1_balance != null && loan_1_balance > 0) ||
+  (loan_1_monthly_payment != null && loan_1_monthly_payment > 0) ||
+  (loan_1_rate != null && loan_1_rate > 0) ||
+  (total_open_loans_amount != null && total_open_loans_amount > 0) ||
+  (loan_1_original_principal != null && loan_1_original_principal > 0);
+
+if (debtSignalExists) {
+  const hasPaymentOrAmortization =
+    (loan_1_monthly_payment != null && loan_1_monthly_payment > 0) ||
+    (loan_1_rate != null && loan_1_rate > 0);
+
+  loan_status = (loan_1_balance > 0 && hasPaymentOrAmortization) ? 'usable' : 'incomplete';
+}
+
+// ==========================================
+// FLAGS / GUARDS
+// ==========================================
+let address_scope_confidence = 'high';
+if (!rawAddress || !rawCity || !rawState || !rawZip) address_scope_confidence = 'low';
+if (is_multifamily && !unit_count) address_scope_confidence = 'medium';
+
+let package_sale_flag = false;
+const ppsf = (lastSaleAmount && sqft) ? lastSaleAmount / sqft : 0;
+
+if (
+  is_multifamily &&
+  lastSaleAmount &&
+  (
+    (assessedTotal && lastSaleAmount > assessedTotal * 2.5) ||
+    ppsf > 450 ||
+    lastSaleAmount >= 750000
+  )
+) {
+  package_sale_flag = true;
+}
+
+const shortSaleLike = /short sale|pre-foreclosure/i.test(
+  `${transcriptA} ${listStatus} ${mlsListStatus}`
+);
+
+// ==========================================
+// RESOLVED OUTPUT
+// ==========================================
+const mode = precall_mode ? 'precall' : 'postcall';
+
+const resolved = {
+  mode,
+  underwriting_mode: mode,
+
+  is_multifamily,
+  address_has_unit_marker: addressHasUnit,
+  address_scope_confidence,
+  package_sale_flag,
+
+  raw_address: rawAddress,
+  raw_city: rawCity,
+  raw_state: rawState,
+  raw_zip: rawZip,
+
+  address_for_value: is_multifamily && addressHasUnit ? strippedAddress : rawAddress,
+  address_for_value_full: joinAddress(
+    is_multifamily && addressHasUnit ? strippedAddress : rawAddress,
+    rawCity,
+    rawState,
+    rawZip
+  ),
+
+  address_for_rent: rawAddress,
+  address_for_rent_full: joinAddress(rawAddress, rawCity, rawState, rawZip),
+
+  property_type_for_value: propertyType,
+  property_type_for_rent: propertyType,
+
+  unit_count: unit_count || null,
+  building_sqft,
+  unit_sqft,
+
+  building_beds: building_beds || null,
+  building_baths: building_baths || null,
+  unit_beds: unit_beds || null,
+  unit_baths: unit_baths || null,
+  extracted_rent_roll: extractedRentRoll,
+
+  // underwriting-relevant normalized fields
+  mls_list_status: mlsListStatus || null,
+  list_status: listStatus || null,
+  est_arv: estArv || null,
+  list_pct_arv: listPctArvPct != null ? listPctArvPct : null,
+  list_pct_arv_ratio: listPctArvRatio != null ? listPctArvRatio : null,
+  list_arv_spread: listArvSpread || null,
+  annual_taxes: annualTaxes || null,
+
+  loan_data: {
+    loan_1_balance,
+    loan_1_monthly_payment,
+    loan_1_rate,
+    total_open_loans_amount,
+    est_monthly_payment,
+    loan_1_original_principal,
+    loan_status
+  },
+
+  source_assumptions: {
+    sqft_input: sqft || null,
+    beds_input: beds || null,
+    baths_input: baths || null,
+    house_style: rawHouseStyle || null,
+    property_type_input: rawPropType || rawPropertyTypeField || null,
+
+    assessed_total_value: assessedTotal || null,
+    est_value: estValue || null,
+    est_arv: estArv || null,
+
+    list_price: listPrice || null,
+    list_status: listStatus || null,
+    mls_list_status: mlsListStatus || null,
+    list_pct_arv: listPctArvPct != null ? listPctArvPct : null,
+    list_pct_arv_ratio: listPctArvRatio != null ? listPctArvRatio : null,
+    list_arv_spread: listArvSpread || null,
+
+    annual_taxes: annualTaxes || null,
+    last_sale_amount: lastSaleAmount || null,
+    year_built: yearBuilt || null,
+    lot_area: lotArea || null,
+
+    vacancy_flag: vacancyFlagRaw || null,
+    vacancy_bool: toBoolLike(vacancyFlagRaw),
+    owner_occupied_flag: ownerOccupiedRaw || null,
+    owner_occupied_bool: toBoolLike(ownerOccupiedRaw),
+
+    is_outreach_property: isOutreachPropertyRaw || null,
+    is_outreach_property_bool: isOutreachPropertyBool,
+
+    est_equity_raw: estEquity,
+    highRentEst: highRentEst,
+    lowRentEst: lowRentEst,
+    parsed_from_opportunity_name: parsedOppStreet || null
+  },
+
+  source_policy: {
+    property_data_source: 'customData_authoritative',
+    property_fallback_to_body_enabled: isOutreachPropertyBool,
+    property_fallback_reason: isOutreachPropertyBool ? 'opp.is_outreach_property = Yes' : null
+  },
+
+  guards: {
+    block_if_missing_address: !rawAddress || !rawCity || !rawState || !rawZip,
+    block_if_unit_count_unknown: is_multifamily && !unit_count,
+    block_if_loan_incomplete: loan_status === 'incomplete',
+    block_if_short_sale_like: shortSaleLike
+  }
+};
+
+return [{ json: { ...webhook, resolved } }];
