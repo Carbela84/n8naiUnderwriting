@@ -1,0 +1,309 @@
+const items = $input.all();
+const results = [];
+
+const body = $('Start Webhook1').first().json.body || {};
+const rawHouseStyle = body['House Style'] || body['🏘️Structure Style'] || '';
+
+function cleanSpaces(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
+}
+
+function parseNum(val) {
+  if (val === undefined || val === null || val === "") return null;
+  const num = Number(String(val).replace(/[^0-9.-]+/g, ""));
+  return Number.isFinite(num) ? num : null;
+}
+
+function hasUnitMarker(address) {
+  const s = cleanSpaces(address).toLowerCase();
+  return /(?:\b(?:apt|apartment|unit|ste|suite)\b|#)\s*[a-z0-9-]+\b/.test(s);
+}
+
+function stripUnit(address) {
+  return cleanSpaces(address)
+    .replace(/(?:\b(?:apt|apartment|unit|ste|suite)\b|#)\s*[a-z0-9-]+\b/ig, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function joinAddress(addressLine, city, state, zip) {
+  return cleanSpaces([addressLine, city, state, zip].filter(Boolean).join(', '));
+}
+
+function inferUnitCount(propModeStr, notesStr, addressHasUnit, sqft, units, beds, baths) {
+  const explicitUnits = parseNum(units);
+  if (explicitUnits && explicitUnits > 0) return explicitUnits;
+
+  const s = String(propModeStr || "").toLowerCase() + " " + String(notesStr || "").toLowerCase();
+
+  const explicitMatch = s.match(/(?:(\d+)\s*units?|(?:number of units|units?)[#:\s]+(\d+))/i);
+  if (explicitMatch) {
+    const explicitCount = parseInt(explicitMatch[1] || explicitMatch[2], 10);
+    if (explicitCount > 0) return explicitCount;
+  }
+
+  if (/sixplex|6-plex|6 units|six units/.test(s)) return 6;
+  if (/fiveplex|5-plex|5 units|five units/.test(s)) return 5;
+  if (/quad|fourplex|4-plex|4 units|four units/.test(s)) return 4;
+  if (/triplex|3-plex|3 units|three units/.test(s)) return 3;
+  if (/duplex|2-plex|2 units|two units/.test(s)) return 2;
+
+  if (addressHasUnit && sqft >= 2500) return 4;
+  return null;
+}
+
+for (const item of items) {
+  const opp = item.json;
+  const res = opp.resolved || {};
+
+  const rawAddress = res.addressRaw || res.raw_address || "";
+  const rawCity = res.city || res.raw_city || "";
+  const rawState = String(res.state || res.raw_state || "").toUpperCase();
+
+  let rawZip = res.zip || res.raw_zip || "";
+  if (String(rawZip).includes('-')) rawZip = String(rawZip).split('-')[0].trim();
+
+  const propertyType = res.mode || "Single Family";
+  const is_multifamily = !res.isSFH;
+
+  const beds = res.beds || 0;
+  const baths = res.baths || 0;
+  const sqft = res.sqft || 0;
+  const assessedTotal = res.assessedTotal || 0;
+  const lastSaleAmount = res.lastSaleAmount || 0;
+
+  const listPrice = res.listPrice || null;
+  const estValue = res.estValue || null;
+  const estEquity = res.estEquity || null;
+  const estArv = res.est_arv || null;
+  const annualTaxes = res.annual_taxes || null;
+  const units = res.units || null;
+  const lotArea = res.lotArea || null;
+  const yearBuilt = res.yearBuilt || null;
+
+  const listStatus = res.listStatus || null;
+  const mlsListStatus = res.mls_list_status || null;
+  const ownerOccupied = res.ownerOccupied || null;
+  const vacancy = res.vacancy || null;
+  const isOutreachProperty = res.isOutreachProperty || null;
+  const highRentEst = res.highRentEst || null;
+  const lowRentEst = res.lowRentEst || null;
+  const listArvPct = res.list_arv_pct || null;
+  const listArvSpread = res.list_arv_spread || null;
+
+  const prequalifiedPhoneTranscript = res.prequalified_phone_transcript || null;
+  const contactPqTranscript = res.contact_pq_transcript || null;
+  const prequalLeadScore = res.prequal_lead_score || null;
+
+  const notes = res.notes || null;
+
+  const loan_data = res.loan_data || {
+    loan_1_balance: 0,
+    loan_1_monthly_payment: 0,
+    loan_1_rate: 0,
+    total_open_loans_amount: 0,
+    est_monthly_payment: 0
+  };
+
+  const precall_mode = !res.notes;
+
+  const addressHasUnit = hasUnitMarker(rawAddress);
+  const strippedAddress = stripUnit(rawAddress);
+
+  const lowerNotes = String(res.notes || "").toLowerCase();
+
+  let extractedRentRoll = null;
+
+  const totalRentMatch =
+    lowerNotes.match(/\$?([\d,]+(?:\.\d{2})?)\/?mo\s*(?:total)?/i) ||
+    lowerNotes.match(/\$?([\d,]+(?:\.\d{2})?)\s*(?:a|per)\s*month/i);
+
+  if (totalRentMatch) {
+    extractedRentRoll = parseFloat(totalRentMatch[1].replace(/,/g, ''));
+  }
+
+  if (!extractedRentRoll) {
+    const rentRegex = /(?:rent roll|gross rent|monthly rent|rents are)[^\d\$]*\$?([\d,]+(?:\.\d{2})?)/i;
+    const rentMatch = lowerNotes.match(rentRegex);
+    if (rentMatch) {
+      extractedRentRoll = parseFloat(rentMatch[1].replace(/,/g, ''));
+    }
+  }
+
+  let extractedUnitBeds = null;
+  let extractedUnitBaths = null;
+
+  const directBedBathMatch = lowerNotes.match(/(\d+(?:\.\d)?)\s*beds?\s*\/\s*(\d+(?:\.\d)?)\s*baths?/i);
+
+  if (directBedBathMatch) {
+    extractedUnitBeds = parseFloat(directBedBathMatch[1]);
+    extractedUnitBaths = parseFloat(directBedBathMatch[2]);
+  } else {
+    const bedBathMatch = lowerNotes.match(/(?:unit beds\/baths|beds\s*\/\s*baths|beds?\/baths?|beds\s*and\s*baths)[^\d]*(\d+(?:\.\d)?)\s*\/\s*(\d+(?:\.\d)?)/i);
+    if (bedBathMatch) {
+      extractedUnitBeds = parseFloat(bedBathMatch[1]);
+      extractedUnitBaths = parseFloat(bedBathMatch[2]);
+    }
+  }
+
+  const mappedUnits = res.units || res.unit_count || res.source_assumptions?.units || null;
+
+  let unit_count = is_multifamily
+    ? inferUnitCount(propertyType, res.notes, addressHasUnit, sqft, mappedUnits, beds, baths)
+    : 1;
+
+  let building_sqft = sqft;
+  let unit_sqft = sqft;
+
+  let building_beds = beds;
+  let building_baths = baths;
+  let unit_beds = beds;
+  let unit_baths = baths;
+
+  if (is_multifamily && unit_count) {
+    building_beds = beds || null;
+    building_baths = baths || null;
+
+    if (extractedUnitBeds !== null) {
+      unit_beds = extractedUnitBeds;
+    } else if (beds && beds >= unit_count) {
+      unit_beds = Math.max(1, Math.round((beds / unit_count) * 10) / 10);
+    } else {
+      unit_beds = null;
+    }
+
+    if (extractedUnitBaths !== null) {
+      unit_baths = extractedUnitBaths;
+    } else if (baths && baths >= unit_count) {
+      unit_baths = Math.max(1, Math.round((baths / unit_count) * 10) / 10);
+    } else {
+      unit_baths = null;
+    }
+  }
+
+  if (is_multifamily && unit_count && sqft > 0) {
+    building_sqft = sqft;
+    unit_sqft = Math.max(1, Math.round(sqft / unit_count));
+  }
+
+  const address_for_value_line = is_multifamily && addressHasUnit ? strippedAddress : rawAddress;
+  const address_for_rent_line = rawAddress;
+
+  let address_scope_confidence = 'high';
+  if (is_multifamily && addressHasUnit) address_scope_confidence = 'medium';
+  if (is_multifamily && !unit_count) address_scope_confidence = 'medium';
+  if (!rawAddress || !rawCity || !rawState || !rawZip) address_scope_confidence = 'low';
+
+  let package_sale_flag = false;
+  const ppsf = (lastSaleAmount > 0 && sqft > 0) ? lastSaleAmount / sqft : 0;
+
+  if (
+    is_multifamily &&
+    lastSaleAmount > 0 &&
+    (
+      (assessedTotal > 0 && lastSaleAmount > assessedTotal * 2.5) ||
+      ppsf > 450 ||
+      lastSaleAmount >= 750000
+    )
+  ) {
+    package_sale_flag = true;
+  }
+
+  const finalResolved = {
+    underwriting_mode: precall_mode ? 'precall' : 'postcall',
+    is_multifamily,
+    address_has_unit_marker: addressHasUnit,
+    address_scope_confidence,
+    package_sale_flag,
+
+    raw_address: rawAddress,
+    raw_city: rawCity,
+    raw_state: rawState,
+    raw_zip: rawZip,
+
+    address_for_value: address_for_value_line,
+    address_for_value_full: joinAddress(address_for_value_line, rawCity, rawState, rawZip),
+
+    address_for_rent: address_for_rent_line,
+    address_for_rent_full: joinAddress(address_for_rent_line, rawCity, rawState, rawZip),
+
+    property_type_for_value: propertyType,
+    property_type_for_rent: propertyType,
+
+    unit_count: unit_count || null,
+    building_sqft,
+    unit_sqft,
+
+    building_beds: building_beds || null,
+    building_baths: building_baths || null,
+    unit_beds: unit_beds || null,
+    unit_baths: unit_baths || null,
+
+    extracted_rent_roll: extractedRentRoll,
+
+    loan_data,
+
+    source_assumptions: {
+      sqft_input: sqft || null,
+      beds_input: beds || null,
+      baths_input: baths || null,
+      house_style: rawHouseStyle || null,
+      property_type_input: propertyType || null,
+
+      assessed_total_value: assessedTotal || null,
+      last_sale_amount: lastSaleAmount || null,
+
+      units: units || unit_count || null,
+
+      list_price: listPrice || null,
+      listPrice: listPrice || null,
+
+      list_status: listStatus || null,
+      listStatus: listStatus || null,
+
+      est_equity: estEquity || null,
+      estEquity: estEquity || null,
+
+      est_value: estValue || null,
+      estValue: estValue || null,
+
+      est_arv: estArv || null,
+      annual_taxes: annualTaxes || null,
+
+      mls_list_status: mlsListStatus || null,
+      list_arv_pct: listArvPct || null,
+      list_arv_spread: listArvSpread || null,
+
+      lot_area: lotArea || null,
+      lotArea: lotArea || null,
+
+      year_built: yearBuilt || null,
+      yearBuilt: yearBuilt || null,
+
+      vacancy: vacancy || null,
+
+      owner_occupied: ownerOccupied || null,
+      ownerOccupied: ownerOccupied || null,
+
+      is_outreach_property: isOutreachProperty || null,
+      isOutreachProperty: isOutreachProperty || null,
+
+      high_rent_est: highRentEst || null,
+      highRentEst: highRentEst || null,
+
+      low_rent_est: lowRentEst || null,
+      lowRentEst: lowRentEst || null,
+
+      prequalified_phone_transcript: prequalifiedPhoneTranscript || null,
+      contact_pq_transcript: contactPqTranscript || null,
+      prequal_lead_score: prequalLeadScore || null,
+
+      notes
+    }
+  };
+
+  opp.resolved = finalResolved;
+  results.push({ json: opp });
+}
+
+return results;
