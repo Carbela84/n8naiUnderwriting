@@ -1,0 +1,47 @@
+const items = $input.all();
+
+// We group by Contact ID to ensure this is completely safe even if you do bulk processing!
+const grouped = {};
+
+for (const item of items) {
+  // Grab the contact ID or fallback
+  const cId = item.json.contactId || 'unknown_contact';
+  if (!grouped[cId]) {
+    grouped[cId] = [];
+  }
+  grouped[cId].push(item);
+}
+
+const finalItems = [];
+
+// For each contact, we pick the best opportunity to proceed
+for (const cId in grouped) {
+  const cItems = grouped[cId];
+  
+  cItems.sort((a, b) => {
+    // Priority 1: Prefer 'postcall' underwriting mode
+    const aPost = a.json.resolved?.underwriting_mode === 'postcall' ? 1 : 0;
+    const bPost = b.json.resolved?.underwriting_mode === 'postcall' ? 1 : 0;
+    if (aPost !== bPost) return bPost - aPost;
+
+    // Priority 2: Prefer High/Medium Confidence Addresses
+    const aHighConf = (a.json.resolved?.address_scope_confidence === 'high' || a.json.resolved?.address_scope_confidence === 'medium') ? 1 : 0;
+    const bHighConf = (b.json.resolved?.address_scope_confidence === 'high' || b.json.resolved?.address_scope_confidence === 'medium') ? 1 : 0;
+    if (aHighConf !== bHighConf) return bHighConf - aHighConf;
+
+    // Priority 3: Prefer items that actually have a raw_address string populated
+    const aHasAddr = (a.json.resolved?.raw_address || '').trim().length > 0 ? 1 : 0;
+    const bHasAddr = (b.json.resolved?.raw_address || '').trim().length > 0 ? 1 : 0;
+    if (aHasAddr !== bHasAddr) return bHasAddr - aHasAddr;
+    
+    // Priority 4: If everything else is a tie, fallback to the most recently updated opportunity
+    const dateA = a.json.updatedAt ? new Date(a.json.updatedAt).getTime() : 0;
+    const dateB = b.json.updatedAt ? new Date(b.json.updatedAt).getTime() : 0;
+    return dateB - dateA; // Descending (newest first)
+  });
+  
+  finalItems.push(cItems[0]);
+}
+
+// Return the singular, best opportunity per contact
+return finalItems;
