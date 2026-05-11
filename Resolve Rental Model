@@ -1,0 +1,194 @@
+
+
+
+
+
+
+// ---------- Helpers ----------
+function parseMoney(x) {
+  if (x === undefined || x === null) return 0;
+  if (typeof x === 'number') return x;
+  const s = String(x).replace(/[^\d.\-]/g, '');
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+
+const compsNode = (() => {
+  try { return $('Fetch Comps API').first().json || {}; }
+  catch { return {}; }
+})();
+
+const subj = compsNode.subjectProperty || {};
+const beds = Number(subj.bedrooms || 0);
+const sqft = Number(subj.squareFootage || 0);
+const propType = String(subj.propertyType || '').toLowerCase();
+
+const standardRent = Number($json.standard_rent_monthly);
+
+
+
+
+// ---------- PAD SPLIT CONFIG (from calculator) ----------
+const PAD = {
+  minBeds: 4,
+  minSqft: 2000,
+  targetMinRooms: 5,
+  targetMaxRooms: 7,
+  maxRoomsToAdd: 3,
+  minSqftPerRoom: 260,          // conservative
+  paybackYears: 5,
+  renoPerRoomAdded: 15000,      // YOUR rule
+  costPerBedroomAdded: 17500,
+  costPerBathroomAdded: 15000,
+  furnishingPerRoom: 2500,
+  otherRehab: 5000
+};
+
+// ---------- PAD SPLIT ELIGIBILITY ----------
+const padsplitAllowed =
+  beds >= PAD.minBeds &&
+  sqft >= PAD.minSqft &&
+  ['single family', 'sfh', 'townhome'].includes(propType);
+
+// ---------- PAD SPLIT PLAN ----------
+let padsplitRent = null;
+let padsplitPlan = { reason: 'Not eligible' };
+
+if (padsplitAllowed && standardRent > 0) {
+  // Target rooms: clamp to 5–7
+  let targetRooms = Math.min(PAD.targetMaxRooms, Math.max(PAD.targetMinRooms, beds));
+  let roomsToAdd = Math.max(0, targetRooms - beds);
+  roomsToAdd = Math.min(roomsToAdd, PAD.maxRoomsToAdd);
+
+  // Ensure sqft supports it
+  const sqftPerRoom = r => (r > 0 ? sqft / r : 0);
+  while (targetRooms > beds && sqftPerRoom(targetRooms) < PAD.minSqftPerRoom) {
+    targetRooms -= 1;
+    roomsToAdd = Math.max(0, targetRooms - beds);
+  }
+
+  // Bathroom logic: ideal = ceil(rooms / 2), cap +1
+  const baths = Number(subj.bathrooms || 0);
+  const requiredBaths = Math.ceil(targetRooms / 2);
+  const bathsToAdd = Math.max(
+    0,
+    Math.min(1, Math.ceil(requiredBaths - baths))
+  );
+
+
+  // Renovation estimate (matches your calculator)
+  const renoEstimate =
+    (roomsToAdd * PAD.costPerBedroomAdded) +
+    (bathsToAdd * PAD.costPerBathroomAdded) +
+    (targetRooms * PAD.furnishingPerRoom) +
+    PAD.otherRehab;
+
+  // PadSplit rent model (still conservative)
+  let roomRent = Math.round(standardRent / beds);
+  roomRent = Math.min(1100, Math.max(850, roomRent)); // raise floor to avoid fake splits
+  padsplitRent = targetRooms * roomRent;
+
+  // Feasibility gate: does uplift support $15k per added room?
+  const upliftMonthly = padsplitRent - standardRent;
+  const upliftAnnual = upliftMonthly * 12;
+  const supportedReno = upliftAnnual * PAD.paybackYears;
+  const requiredRenoForGate = roomsToAdd * PAD.renoPerRoomAdded;
+
+  const feasible =
+    roomsToAdd === 0
+      ? upliftMonthly >= 600 // if no build, require real uplift
+      : supportedReno >= requiredRenoForGate;
+
+  // ---------- Bathroom burden ratio (infrastructure risk, NOT a hard gate) ----------
+  const bathRenoCost = bathsToAdd * PAD.costPerBathroomAdded;
+  const totalUpliftValue = upliftAnnual * PAD.paybackYears;
+
+  const bathroomBurdenRatio =
+    totalUpliftValue > 0
+      ? bathRenoCost / totalUpliftValue
+      : null;
+
+  let bathroomInfrastructureRisk = 'low';
+  if (bathroomBurdenRatio !== null) {
+    if (bathroomBurdenRatio > 0.5) bathroomInfrastructureRisk = 'high';
+    else if (bathroomBurdenRatio > 0.3) bathroomInfrastructureRisk = 'moderate';
+  }
+
+
+  if (!feasible) {
+    padsplitRent = null; // DO NOT promote fake upside
+  }
+
+  padsplitPlan = {
+    currentRooms: beds,
+    targetRooms,
+    roomsToAdd,
+    currentBaths: baths,
+    requiredBaths,
+    bathsToAdd,
+    sqftPerRoom: Number(sqftPerRoom(targetRooms).toFixed(1)),
+    roomRent,
+    standardRent,
+    padsplitRentCandidate: targetRooms * roomRent,
+    upliftMonthly,
+    renoEstimate,
+    supportedReno,
+    requiredRenoForGate,
+    totalRenoEstimate: renoEstimate,
+    feasible,
+    // NEW — infrastructure diagnostics
+    bathroomBurdenRatio: bathroomBurdenRatio !== null
+      ? Number(bathroomBurdenRatio.toFixed(2))
+      : null,
+    bathroomInfrastructureRisk
+  };
+}
+
+// ---------- CANONICAL SELECTION ----------
+
+const PAD_SPLIT_PROMOTION_MULTIPLE = 1.40; // Increased gate margin requirements
+let canonical = 'standard'
+
+if (
+  padsplitAllowed &&
+  padsplitPlan?.feasible &&
+  padsplitRent &&
+  padsplitRent >= standardRent * PAD_SPLIT_PROMOTION_MULTIPLE
+) {
+  canonical = 'padsplit'
+}
+
+// ---------- OUTPUT ----------
+return [{
+  json: {
+    ...$json,
+    rental_estimates: $json.rental_estimates ?? null,
+    rental_models: {
+      standard: {
+        grossRentMonthly: standardRent,
+        assumptions: {
+          vacancyRate: 0.05,
+          mgmtRate: 0.08,
+          maintRate: 0.05,
+          utilitiesIncluded: false
+        }
+      },
+      padsplit: {
+        allowed: padsplitAllowed,
+        feasible: padsplitPlan?.feasible ?? false,
+        grossRentMonthly: padsplitRent,
+        assumptions: {
+          vacancyRate: 0.12,
+          mgmtRate: 0.18,
+          maintRate: 0.09,
+          utilitiesIncluded: true
+        },
+        debug: padsplitPlan
+      }
+
+    },
+
+    canonical_rental_model: canonical
+  }
+}]
