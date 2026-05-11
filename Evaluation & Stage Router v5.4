@@ -1,0 +1,2155 @@
+/**
+ * Evaluation & Stage Router v5.4
+ *
+ * Purpose:
+ * - Offer Engine creates offers.
+ * - This router scores seller acceptance probability and routes the lead.
+ * - It does not suppress/cap the Offer Engine's offer math.
+ *
+ * v5.4 Production Guardrails:
+ * - Keeps v5.3 transcript/script sanitization.
+ * - Does not treat generated follow-up scripts / nextSteps as seller evidence.
+ * - Prevents fake seller floors from numbered script questions.
+ * - Excludes fallback / non-marketable / non-seller-facing creative offers from creative probability.
+ * - Adds lifecycle bypass for DNC / sold / closed / pending / escrow / under contract.
+ * - Adds data-quality gate for contradictory anchors, impossible value spreads, missing sqft on high-value assets, and malformed money fields.
+ * - Forces Manual Review when data quality is too risky for automated routing.
+ * - Keeps pre-call leads out of Dead and Closer unless a lifecycle/DNC bypass is explicit.
+ */
+
+const SCORING_VERSION = 'acceptance-router-v5.4-production-guards';
+
+const EVAL = {
+  HOT: { label: '🔥 Hot', value: 'hot' },
+  WARM: { label: '🌧️ Warm', value: 'warm' },
+  FOLLOWUP: { label: '📞 Follow-Up', value: 'followup' },
+  COLD: { label: '🥶 Cold', value: 'cold' },
+  DEAD: { label: '☠️ Dead', value: 'dead' },
+  MANUAL: { label: '🤝 Manual Review', value: 'manual_review' },
+  DNC: { label: '🚫 DNC', value: 'dnc' }
+};
+
+const STAGES = {
+  CLOSER: '3. Closer Call',
+  UNDERWRITER: '2. Underwriter Review',
+  FOLLOWUP: '1.5 Prequal Answered: Following Up',
+  NURTURE: '9. Cold: Long-Term Nurture',
+  DEAD: '10. Dead: Inactive',
+  NOT_INTERESTED: '11. Cold/Not Interested',
+  DNC: '12. DNC: Do Not contact'
+};
+
+function T(v) {
+  return String(v ?? '').trim();
+}
+
+function lower(v) {
+  return T(v).toLowerCase();
+}
+
+function isObj(v) {
+  return v && typeof v === 'object' && !Array.isArray(v);
+}
+
+function num(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+  if (typeof v === 'boolean') return v ? 1 : 0;
+
+  let s = String(v).trim().toLowerCase();
+  const isK = /\bk\b/.test(s);
+  s = s.replace(/[^\d.-]/g, '');
+
+  const n = Number(s);
+  if (!Number.isFinite(n)) return 0;
+  if (isK && n < 10000) return n * 1000;
+  return n;
+}
+
+function round(n, d = 2) {
+  const p = Math.pow(10, d);
+  return Math.round((Number(n) || 0) * p) / p;
+}
+
+function clamp(v, min, max) {
+  return Math.min(max, Math.max(min, Number(v) || 0));
+}
+
+function clampInt(v, min, max) {
+  return Math.round(clamp(v, min, max));
+}
+
+function money(n) {
+  return `$${Math.round(Number(n) || 0).toLocaleString('en-US')}`;
+}
+
+function pct(n, d = 1) {
+  return `${round(n, d).toFixed(d)}%`;
+}
+
+function firstNum(...vals) {
+  for (const v of vals) {
+    const n = num(v);
+    if (n !== 0) return n;
+  }
+  return 0;
+}
+
+function getNode(name, fallback = {}) {
+  try {
+    return $(name).first().json || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function hasDigits(v) {
+  return /\d/.test(String(v ?? ''));
+}
+
+function looksMalformedMoney(...vals) {
+  return vals.some(v => {
+    if (v === null || v === undefined || typeof v === 'number') return false;
+    const s = String(v).trim();
+    if (!s) return false;
+    if (/^\$+\s*$/.test(s)) return true;
+    if (/\$/.test(s) && !hasDigits(s)) return true;
+    if (/nan|undefined|null/i.test(s)) return true;
+    return false;
+  });
+}
+
+function highLowRatio(a, b) {
+  const x = num(a);
+  const y = num(b);
+  if (x <= 0 || y <= 0) return null;
+  return Math.max(x, y) / Math.min(x, y);
+}
+
+function extractOffer(root, output, label) {
+  if (label === 'Primary Offer') {
+    return (
+      root?.deal_structure?.['Primary Offer'] ||
+      output?.deal_structure?.['Primary Offer'] ||
+      root?.offers?.primary_offer ||
+      root?.offers?.primaryOffer ||
+      output?.offers?.primary_offer ||
+      output?.offers?.primaryOffer ||
+      {}
+    );
+  }
+
+  if (label === 'Updated Cash Offer') {
+    return (
+      root?.deal_structure?.['Updated Cash Offer'] ||
+      output?.deal_structure?.['Updated Cash Offer'] ||
+      root?.offers?.cash_offer ||
+      root?.offers?.cashOffer ||
+      output?.offers?.cash_offer ||
+      output?.offers?.cashOffer ||
+      {}
+    );
+  }
+
+  return {};
+}
+
+function hasMeaningfulRawTranscript(v) {
+  const s = T(v);
+  if (!s) return false;
+  if (isNoTranscriptPlaceholder(s)) return false;
+  if (s.length < 40) return false;
+  return true;
+}
+
+function extractTranscript(root, output) {
+  const webhook = getNode('Start Webhook1', {});
+
+  const customData =
+    root.webhook_custom_data ||
+    root.customData ||
+    root.body?.customData ||
+    output.webhook_custom_data ||
+    output.customData ||
+    output.body?.customData ||
+    webhook.body?.customData ||
+    {};
+
+  const rawTranscript = [
+    root.raw_transcript,
+    root.call_transcript,
+    root.contact_pq_transcript,
+    root.prequalified_phone_transcript,
+
+    output.raw_transcript,
+    output.call_transcript,
+    output.contact_pq_transcript,
+    output.prequalified_phone_transcript,
+
+    customData.contact_pq_transcript,
+    customData.prequalified_phone_transcript,
+    customData.phone_transcript,
+    customData.transcript,
+    customData['contact_pq_transcript'],
+    customData['prequalified_phone_transcript']
+  ].find(hasMeaningfulRawTranscript);
+
+  if (rawTranscript) {
+    return {
+      raw_call_transcript: rawTranscript
+    };
+  }
+
+  const analyzer = getNode('Phone Transcript analyzer', {});
+
+  const candidates = [
+    root?.transcript?.output,
+    root?.transcript,
+    output?.transcript?.output,
+    output?.transcript,
+    analyzer?.output,
+    analyzer,
+    root?.transcript_insights,
+    output?.transcript_insights,
+    root?.output_transcript_raw,
+    output?.output_transcript_raw
+  ];
+
+  for (const c of candidates) {
+    if (isObj(c)) return c;
+  }
+
+  return {};
+}
+
+function isGeneratedTranscriptKey(key) {
+  const k = lower(key);
+  return (
+    k === 'nextsteps' ||
+    k === 'next_steps' ||
+    k === 'tasknotes' ||
+    k === 'task_notes' ||
+    k.includes('suggestedfollowupscript') ||
+    k.includes('suggested follow up script') ||
+    k.includes('followupscript') ||
+    k.includes('follow_up_script') ||
+    k.includes('follow up script') ||
+    k.includes('callscript') ||
+    k.includes('call_script') ||
+    k.includes('script') ||
+    k.includes('prequalifier instruction')
+  );
+}
+
+function isNoTranscriptPlaceholder(v) {
+  const s = lower(v);
+  if (!s) return true;
+  return (
+    s === 'no transcript provided' ||
+    s === 'no transcript' ||
+    s === 'no call transcript' ||
+    s === 'transcript not provided' ||
+    s.includes('no transcript provided') ||
+    s.includes('no call transcript') ||
+    s.includes('transcript not provided')
+  );
+}
+
+function cleanTranscriptForSellerEvidence(input) {
+  if (input === null || input === undefined) return {};
+
+  if (typeof input === 'string') {
+    return isNoTranscriptPlaceholder(input) ? '' : input;
+  }
+
+  if (Array.isArray(input)) {
+    return input
+      .map(x => cleanTranscriptForSellerEvidence(x))
+      .filter(x => {
+        if (x === null || x === undefined) return false;
+        if (typeof x === 'string' && !T(x)) return false;
+        if (Array.isArray(x) && !x.length) return false;
+        if (isObj(x) && !Object.keys(x).length) return false;
+        return true;
+      });
+  }
+
+  if (isObj(input)) {
+    const out = {};
+
+    Object.keys(input).forEach(key => {
+      if (isGeneratedTranscriptKey(key)) return;
+
+      const value = input[key];
+      if (typeof value === 'string' && isNoTranscriptPlaceholder(value)) return;
+
+      const cleaned = cleanTranscriptForSellerEvidence(value);
+      if (cleaned === null || cleaned === undefined) return;
+      if (typeof cleaned === 'string' && !T(cleaned)) return;
+      if (Array.isArray(cleaned) && !cleaned.length) return;
+      if (isObj(cleaned) && !Object.keys(cleaned).length) return;
+
+      out[key] = cleaned;
+    });
+
+    return out;
+  }
+
+  return input;
+}
+
+function transcriptText(transcript) {
+  const cleanTranscript = cleanTranscriptForSellerEvidence(transcript);
+  return lower(JSON.stringify(cleanTranscript || {}));
+}
+
+function hasRealTranscript(transcript) {
+  const cleanTranscript = cleanTranscriptForSellerEvidence(transcript);
+  const blob = lower(JSON.stringify(cleanTranscript || {}));
+
+  if (!blob || blob === '{}' || blob.length < 20) return false;
+  if (/no\s+transcript\s+provided|no\s+call\s+transcript|transcript\s+not\s+provided|no\s+transcript/.test(blob)) return false;
+  return true;
+}
+
+function normalizeExecutionContext(root, output, transcript) {
+  const resolved = root.resolved || output.resolved || {};
+  const rawMode = lower(
+    root.execution_context ||
+    output.execution_context ||
+    resolved.underwriting_mode ||
+    resolved.mode ||
+    ''
+  );
+
+  if (rawMode.includes('post')) return 'post_call';
+  if (rawMode.includes('pre')) return 'pre_call';
+  return hasRealTranscript(transcript) ? 'post_call' : 'pre_call';
+}
+
+function moneyTokenToNumber(rawAmount, suffix) {
+  const cleaned = String(rawAmount ?? '').replace(/[^\d.-]/g, '');
+  let n = Number(cleaned);
+  if (!Number.isFinite(n)) return 0;
+
+  const s = lower(suffix);
+  if (s === 'k' && n < 10000) n *= 1000;
+  if (s === 'm' && n < 10000000) n *= 1000000;
+
+  return n;
+}
+
+function isDownPaymentContext(text) {
+  const s = lower(text);
+
+  return (
+    /\bdown\s*payment\b/.test(s) ||
+    /\bminimum\s+down\b/.test(s) ||
+    /\bmin\s+down\b/.test(s) ||
+    /\bneeds?\s+\$?[\d,.]+\s*k?\s+down\b/.test(s) ||
+    /\bneed\s+\$?[\d,.]+\s*k?\s+down\b/.test(s) ||
+    /\bhas\s+to\s+get\s+\$?[\d,.]+\s*k?\s+down\b/.test(s) ||
+    /\bless\s+than\s+\$?[\d,.]+\s*k?\s+down\b/.test(s) ||
+    /\bwill\s+not\s+entertain\b.{0,80}\bdown\b/.test(s) ||
+    /\bwon'?t\s+entertain\b.{0,80}\bdown\b/.test(s) ||
+    /\bcash\s+to\s+seller\b/.test(s) ||
+    /\bcts\b/.test(s) ||
+    /\bcash\s+upfront\b/.test(s) ||
+    /\bupfront\s+cash\b/.test(s) ||
+    /\bupfront\b/.test(s)
+  );
+}
+
+function extractDollarNear(blob, patterns, minAmount = 10000, opts = {}) {
+  const text = lower(blob);
+  if (!text) return 0;
+
+  const options = {
+    excludeDownPaymentContext: false,
+    requireDownPaymentContext: false,
+    windowBefore: 90,
+    windowAfter: 120,
+    ...opts
+  };
+
+  const moneyRe = /\$?\s*([\d]{1,3}(?:,[\d]{3})+|[\d]+(?:\.[\d]+)?)\s*(k|m)?\b/gi;
+
+  for (const pattern of patterns) {
+    const patternRe = new RegExp(pattern, 'gi');
+    let pm;
+
+    while ((pm = patternRe.exec(text)) !== null) {
+      const start = Math.max(0, pm.index - options.windowBefore);
+      const end = Math.min(text.length, pm.index + String(pm[0]).length + options.windowAfter);
+      const window = text.slice(start, end);
+
+      const downCtx = isDownPaymentContext(window);
+
+      if (options.excludeDownPaymentContext && downCtx) continue;
+      if (options.requireDownPaymentContext && !downCtx) continue;
+
+      moneyRe.lastIndex = 0;
+      let mm;
+
+      while ((mm = moneyRe.exec(window)) !== null) {
+        const n = moneyTokenToNumber(mm[1], mm[2]);
+
+        // Prevent script numbering, rates, bath counts, etc.
+        if (n < minAmount) continue;
+
+        // If no k/m/$ and number is small, reject.
+        const fullToken = String(mm[0] || '');
+        const hasMoneySignal = fullToken.includes('$') || lower(mm[2]) === 'k' || lower(mm[2]) === 'm' || /,/.test(fullToken);
+        if (!hasMoneySignal && n < 10000) continue;
+
+        return n;
+      }
+    }
+  }
+
+  return 0;
+}  
+
+
+function inferSellerStance({ transcript, executionContext, publicText }) {
+  const sellerEvidence = transcriptText(transcript);
+  const publicOnly = lower(publicText);
+
+  const blob = executionContext === 'post_call'
+    ? `${sellerEvidence} ${publicOnly}`
+    : publicOnly;
+
+  const sourceForFirmStance = executionContext === 'post_call'
+    ? sellerEvidence
+    : publicOnly;
+
+  const stance = {
+    urgency_band: 'unknown',
+    price_flexibility: 'unknown',
+    terms_openness: 'unknown',
+    creative_discussed: false,
+    cash_preference: 'unknown',
+    cash_need: 'unknown',
+    seller_minimum_price: 0,
+    seller_minimum_down_payment: 0,
+    seller_stated_ask: 0,
+    direct_quote_basis: executionContext === 'post_call',
+    motivation_confidence: executionContext === 'post_call' ? 70 : 35
+  };
+
+  // IMPORTANT:
+  // Extract down-payment requirement FIRST.
+  // Otherwise phrases like "$25k down minimum" can be falsely parsed as seller_minimum_price.
+  stance.seller_minimum_down_payment = extractDollarNear(sourceForFirmStance, [
+    'down payment',
+    'minimum down',
+    'min down',
+    'needs down',
+    'need down',
+    'cash to seller',
+    'cash upfront',
+    'upfront',
+    'cts',
+    'less than',
+    'will not entertain',
+    'won\'t entertain'
+  ], 1000, {
+     requireDownPaymentContext: true
+  });
+
+   // Seller minimum PRICE must exclude down-payment language.
+   // "$25k down" is not a $25k purchase-price floor.
+  stance.seller_minimum_price = extractDollarNear(sourceForFirmStance, [
+    'minimum',
+    'min',
+    'lowest',
+    'bottom',
+    'bottom line',
+    'need',
+    'needs',
+    'has to get',
+    'must get',
+    'walk away with',
+    'net',
+    'take'
+  ], 10000, {
+    excludeDownPaymentContext: true
+  });
+
+  stance.seller_stated_ask = extractDollarNear(sourceForFirmStance, [
+    'asking',
+    'listed at',
+    'list price',
+    'wants',
+    'want',
+    'price is',
+    'firm at',
+    'purchase price',
+    'sale price'
+  ], 10000, {
+    excludeDownPaymentContext: true
+  });
+
+  if (/foreclosure|pre[-\s]?foreclosure|behind|arrears|urgent|asap|immediately|must\s+sell|need\s+to\s+sell|hardship|desperate/.test(blob)) {
+    stance.urgency_band = 'critical';
+  } else if (/vacant|inherited|probate|relocat|divorce|out\s+of\s+state|tired\s+landlord/.test(blob)) {
+    stance.urgency_band = 'high';
+  } else if (/motivated|wants\s+to\s+sell|needs\s+sold|bring\s+offer|bring\s+offers/.test(blob)) {
+    stance.urgency_band = 'medium';
+  } else if (/no\s+rush|not\s+in\s+a\s+hurry|not\s+motivated|testing\s+the\s+market/.test(blob)) {
+    stance.urgency_band = 'none';
+  }
+
+  if (/firm|retail|full\s+price|list\s+price|won'?t\s+discount|will\s+not\s+go\s+below|not\s+flexible|price\s+is\s+firm/.test(sourceForFirmStance)) {
+    stance.price_flexibility = 'retail_only';
+  } else if (/somewhat\s+flexible|slightly\s+flexible|minor\s+discount|small\s+discount|little\s+flexible|hesitant/.test(blob)) {
+    stance.price_flexibility = 'slightly_flexible';
+  } else if (/flexible|negotiable|bring\s+offer|bring\s+offers|any\s+offer|open\s+to\s+offer|price\s+drop|price\s+reduc|reduced|discounted\s+cash\s+offer|entertain\s+offers/.test(blob)) {
+    stance.price_flexibility = 'flexible';
+  }
+
+  if (/cash\s+only|no\s+creative|not\s+open\s+to\s+terms|no\s+seller\s+finance|no\s+subject|no\s+subto/.test(sourceForFirmStance)) {
+    stance.terms_openness = 'no_creative';
+    stance.creative_discussed = true;
+  } else if (/open\s+to\s+terms|creative|seller\s+finance|subject\s*to|subto|sub\s*to|carry|seller\s+carry|payments/.test(blob)) {
+    stance.terms_openness = 'open';
+    stance.creative_discussed = true;
+  } else if (/maybe|would\s+consider|might\s+consider|possibly|curious/.test(blob)) {
+    stance.terms_openness = 'maybe';
+    stance.creative_discussed = true;
+  }
+
+  if (/cash\s+only|cash\s+buyer|clean\s+close|quick\s+close|prefers\s+cash|prefer\s+cash/.test(blob)) {
+    stance.cash_preference = 'prefers_cash';
+  }
+
+  if (/cash\s+out|needs\s+cash|payoff|required\s+payoff|walk\s+away\s+with/.test(blob)) {
+    stance.cash_need = 'must_cash_out';
+  } else if (/some\s+cash|cash\s+to\s+seller|down\s+payment/.test(blob)) {
+    stance.cash_need = 'some_cash_needed';
+  } else if (/low\s+cash|terms\s+matter|payment\s+matter|monthly\s+income/.test(blob)) {
+    stance.cash_need = 'low_cash_need';
+  }
+
+  if (executionContext === 'post_call') {
+    stance.motivation_confidence = 80;
+    if (stance.urgency_band === 'critical' || stance.price_flexibility !== 'unknown' || stance.terms_openness !== 'unknown') {
+      stance.motivation_confidence = 90;
+    }
+    if (stance.urgency_band === 'unknown' && stance.price_flexibility === 'unknown' && stance.terms_openness === 'unknown') {
+      stance.motivation_confidence = 60;
+    }
+  } else {
+    stance.motivation_confidence = 35;
+    if (/pre[-\s]?foreclosure|foreclosure|tax\s+lien|hoa\s+lien|probate|vacant|absentee|out\s+of\s+state|price\s+reduc|reduced/.test(blob)) {
+      stance.motivation_confidence = 55;
+    }
+  }
+
+  return stance;
+}
+
+function publicMotivationScore({ dom, publicText }) {
+  let score = 35;
+  const text = lower(publicText);
+
+  if (dom >= 180) score += 25;
+  else if (dom >= 120) score += 22;
+  else if (dom >= 90) score += 18;
+  else if (dom >= 45) score += 8;
+
+  if (/price\s+reduc|reduced|recently\s+lowered|motivated\s+seller|bring\s+offers|as[-\s]?is/.test(text)) score += 12;
+  if (/pre[-\s]?foreclosure|foreclosure|tax\s+lien|hoa\s+lien|lis\s+pendens|probate|inherited/.test(text)) score += 20;
+  if (/vacant|absentee|out\s+of\s+state|relocat|tired\s+landlord/.test(text)) score += 10;
+  if (/multiple\s+offers|highest\s+and\s+best|bidding\s+war/.test(text)) score -= 18;
+
+  return clamp(score, 0, 85);
+}
+
+function transcriptMotivationScore({ stance, transcript }) {
+  const blob = transcriptText(transcript);
+  let score = 45;
+
+  if (stance.urgency_band === 'critical') score += 40;
+  else if (stance.urgency_band === 'high') score += 28;
+  else if (stance.urgency_band === 'medium') score += 15;
+  else if (stance.urgency_band === 'none') score -= 30;
+
+  if (/vacant|inherited|probate|relocat|divorce|out\s+of\s+state|tired\s+landlord/.test(blob)) score += 12;
+  if (/multiple\s+offers|highest\s+and\s+best|bidding\s+war/.test(blob)) score -= 20;
+
+  return clamp(score, 0, 100);
+}
+
+function inferListFloorMultiplier({ dom, publicText, stance, executionContext }) {
+  const text = lower(publicText);
+
+  if (executionContext === 'post_call' && stance.price_flexibility === 'retail_only') {
+    return { multiplier: 1, reasons: ['Post-call seller/agent appears firm on retail/list price.'] };
+  }
+
+  let m = 0.99;
+  const reasons = [];
+
+  if (dom >= 180) {
+    m = 0.86;
+    reasons.push('DOM 180+ implies strong listing fatigue.');
+  } else if (dom >= 120) {
+    m = 0.88;
+    reasons.push('DOM 120+ implies meaningful listing fatigue.');
+  } else if (dom >= 90) {
+    m = 0.90;
+    reasons.push('DOM 90+ implies moderate motivation.');
+  } else if (dom >= 45) {
+    m = 0.94;
+    reasons.push('DOM 45+ implies some listing fatigue.');
+  } else if (dom >= 21) {
+    m = 0.97;
+    reasons.push('DOM 21+ is slightly softened.');
+  } else {
+    m = 0.99;
+    reasons.push('Low DOM / no public softness signal.');
+  }
+
+  if (/price\s+reduc|price\s+drop|reduced|lowered|recently\s+lowered/.test(text)) {
+    m -= 0.03;
+    reasons.push('Price reduction signal softened seller floor.');
+  }
+
+  if (/significant\s+price\s+reduc|major\s+price\s+reduc|large\s+price\s+drop/.test(text)) {
+    m -= 0.03;
+    reasons.push('Significant price reduction softened seller floor further.');
+  }
+
+  if (/hesitant|discounted\s+cash\s+offer|would\s+entertain|might\s+entertain|bring\s+offer|bring\s+offers/.test(text)) {
+    m -= 0.02;
+    reasons.push('Agent/seller language suggests some willingness to entertain offers.');
+  }
+
+  if (stance.price_flexibility === 'flexible') {
+    m -= 0.04;
+    reasons.push('Seller/listing signal suggests flexibility.');
+  } else if (stance.price_flexibility === 'slightly_flexible') {
+    m -= 0.02;
+    reasons.push('Seller/listing signal suggests slight flexibility.');
+  }
+
+  if (stance.urgency_band === 'critical') {
+    m -= 0.05;
+    reasons.push('Critical urgency softened seller floor.');
+  } else if (stance.urgency_band === 'high') {
+    m -= 0.02;
+    reasons.push('High urgency softened seller floor.');
+  }
+
+  if (/multiple\s+offers|highest\s+and\s+best|bidding\s+war/.test(text)) {
+    m += 0.04;
+    reasons.push('Competition signal raised seller floor.');
+  }
+
+  const minFloor = executionContext === 'post_call' && stance.urgency_band === 'critical' ? 0.75 : 0.80;
+  return { multiplier: round(clamp(m, minFloor, 1), 4), reasons };
+}
+
+function estimateSellerFloor({ stance, executionContext, listPrice, sellerAsk, asIsValue, arv, publicMotivation, dom, publicText }) {
+  if (stance.seller_minimum_price >= 10000) {
+    return {
+      value: stance.seller_minimum_price,
+      source: 'explicit_seller_minimum',
+      confidence: 'high',
+      multiplier: null,
+      multiplier_reasons: ['Seller gave an explicit minimum / floor.'],
+      notes: 'Seller gave an explicit minimum / floor.'
+    };
+  }
+
+  const softness = inferListFloorMultiplier({ dom, publicText, stance, executionContext });
+
+  if (sellerAsk > 0 || stance.seller_stated_ask > 0) {
+    const ask = sellerAsk || stance.seller_stated_ask;
+    const firm = stance.price_flexibility === 'retail_only' && executionContext === 'post_call';
+    const floor = firm ? ask : ask * softness.multiplier;
+    let confidence = firm ? 'high' : (executionContext === 'post_call' ? 'medium' : 'low');
+    if (!firm && publicMotivation >= 70) confidence = executionContext === 'post_call' ? 'high' : 'medium';
+
+    return {
+      value: round(floor, 0),
+      source: firm ? 'seller_ask_confirmed_firm' : 'seller_ask_adjusted_for_acceptance_estimate',
+      confidence,
+      multiplier: firm ? null : softness.multiplier,
+      multiplier_reasons: firm ? ['Seller/agent appears firm.'] : softness.reasons,
+      notes: 'Seller ask used as anchor, then adjusted for motivation/flexibility unless seller is confirmed firm.'
+    };
+  }
+
+  if (listPrice > 0) {
+    const firm = stance.price_flexibility === 'retail_only' && executionContext === 'post_call';
+    const floor = firm ? listPrice : listPrice * softness.multiplier;
+    let confidence = firm ? 'high' : (executionContext === 'post_call' ? 'medium' : 'low');
+    if (!firm && publicMotivation >= 70) confidence = executionContext === 'post_call' ? 'high' : 'medium';
+
+    return {
+      value: round(floor, 0),
+      source: firm ? 'mls_list_confirmed_firm' : 'mls_list_adjusted_for_acceptance_estimate',
+      confidence,
+      multiplier: firm ? null : softness.multiplier,
+      multiplier_reasons: firm ? ['Seller/agent appears firm.'] : softness.reasons,
+      notes: 'MLS list price used as anchor, but not treated as a rigid seller floor unless seller is confirmed firm.'
+    };
+  }
+
+  if (asIsValue > 0) {
+    return {
+      value: round(asIsValue, 0),
+      source: 'as_is_value_fallback',
+      confidence: 'low',
+      multiplier: null,
+      multiplier_reasons: ['No seller/list price anchor; as-is value used as weak fallback.'],
+      notes: 'No seller/list price anchor; as-is value used as weak fallback.'
+    };
+  }
+
+  if (arv > 0) {
+    return {
+      value: round(arv, 0),
+      source: 'arv_fallback',
+      confidence: 'low',
+      multiplier: null,
+      multiplier_reasons: ['No seller/list/as-is anchor; ARV used as weak fallback.'],
+      notes: 'No seller/list/as-is anchor; ARV used as weak fallback.'
+    };
+  }
+
+  return {
+    value: 0,
+    source: 'missing',
+    confidence: 'none',
+    multiplier: null,
+    multiplier_reasons: ['No reliable price anchor found.'],
+    notes: 'No reliable price anchor found.'
+  };
+}
+
+function cashScoreFromRatio(ratio) {
+  if (!ratio || ratio <= 0) return null;
+  if (ratio < 0.70) return 1;
+  if (ratio < 0.80) return 2;
+  if (ratio < 0.85) return 3;
+  if (ratio < 0.90) return 4;
+  if (ratio < 0.95) return 5;
+  if (ratio < 1.00) return 6;
+  if (ratio < 1.05) return 7;
+  if (ratio < 1.10) return 8;
+  if (ratio < 1.20) return 9;
+  return 10;
+}
+
+function scoreCashProbability({ cashOffer, sellerFloor, stance, executionContext, listPrice, publicMotivationScore, transcriptExists }) {
+  const reasons = [];
+
+  if (!cashOffer || cashOffer <= 0) {
+    return { score: null, ratio: null, score_ceiling: null, reasons: ['Missing or malformed cash offer.'] };
+  }
+
+  if (!sellerFloor.value || sellerFloor.value <= 0) {
+    return { score: null, ratio: null, score_ceiling: null, reasons: ['Missing seller floor / price anchor.'] };
+  }
+
+  const ratio = cashOffer / sellerFloor.value;
+  let score = cashScoreFromRatio(ratio);
+  let scoreCeiling = 10;
+
+  reasons.push(`Base cash probability ${score}/10 from cash offer ratio ${pct(ratio * 100)} of estimated seller floor.`);
+  reasons.push(`Seller floor source: ${sellerFloor.source}; confidence: ${sellerFloor.confidence}.`);
+
+  if (Array.isArray(sellerFloor.multiplier_reasons)) {
+    sellerFloor.multiplier_reasons.forEach(r => reasons.push(`Seller floor adjustment: ${r}`));
+  }
+
+  if (stance.urgency_band === 'critical' || stance.urgency_band === 'high') {
+    score += 1;
+    reasons.push('+1 acceptance likelihood: urgency/distress/speed motivation.');
+  }
+
+  if (stance.price_flexibility === 'flexible') {
+    score += 1;
+    reasons.push('+1 acceptance likelihood: seller flexibility.');
+  }
+
+  if (stance.cash_preference === 'prefers_cash') {
+    score += 1;
+    reasons.push('+1 acceptance likelihood: seller prefers cash / clean close.');
+  }
+
+  if (stance.price_flexibility === 'retail_only') {
+    score -= 2;
+    reasons.push('-2 acceptance likelihood: seller appears firm / retail-only.');
+  } else if (stance.price_flexibility === 'slightly_flexible') {
+    score -= 1;
+    reasons.push('-1 acceptance likelihood: seller only slightly flexible.');
+  }
+
+  if (listPrice > 0 && cashOffer < listPrice * 0.70 && stance.price_flexibility !== 'flexible' && publicMotivationScore < 50) {
+    score -= 1;
+    reasons.push('-1 acceptance likelihood: cash offer is below 70% of list with weak public motivation.');
+  }
+
+  if (stance.seller_minimum_price >= 10000 && cashOffer < stance.seller_minimum_price) {
+    scoreCeiling = Math.min(scoreCeiling, 4);
+    reasons.push('Acceptance likelihood ceiling 4/10: seller gave a minimum above the cash offer.');
+  }
+
+  if (sellerFloor.confidence === 'none') {
+    scoreCeiling = Math.min(scoreCeiling, 5);
+    reasons.push('Acceptance likelihood ceiling 5/10: no reliable floor estimate.');
+  } else if (sellerFloor.confidence === 'low') {
+    scoreCeiling = Math.min(scoreCeiling, 6);
+    reasons.push('Acceptance likelihood ceiling 6/10: weak seller floor confidence.');
+  }
+
+  if (!transcriptExists && executionContext === 'pre_call') {
+    scoreCeiling = Math.min(scoreCeiling, 6);
+    reasons.push('Acceptance likelihood ceiling 6/10: pre-call execution; seller conversation is not confirmed.');
+  }
+
+  if (executionContext === 'pre_call' && publicMotivationScore < 45) {
+    scoreCeiling = Math.min(scoreCeiling, 6);
+    reasons.push('Acceptance likelihood ceiling 6/10: pre-call with weak public motivation signals.');
+  }
+
+  score = clampInt(Math.min(score, scoreCeiling), 1, 10);
+  return { score, ratio: round(ratio, 4), score_ceiling: scoreCeiling, reasons };
+}
+
+function isSellerFacingCreative(primaryOffer, engineStatus) {
+  const justification = lower(primaryOffer?.Justification || primaryOffer?.justification || '');
+  const type = lower(primaryOffer?.Type || primaryOffer?.offer_type || '');
+  const raw = primaryOffer?.raw || {};
+
+  if (!primaryOffer || !Object.keys(primaryOffer).length) return false;
+  if (engineStatus?.seller_facing_allowed === false) return false;
+  if (engineStatus?.primary_viable === false) return false;
+  if (engineStatus?.quality_tier === 'non_marketable') return false;
+  if (engineStatus?.status === 'fallback_only_or_thin') return false;
+  if (engineStatus?.forced_fallback_used === true) return false;
+  if (raw?.forcedFallback === true) return false;
+  if (raw?.pass === false) return false;
+  if (primaryOffer?.['Deal Viable'] === false) return false;
+  if (type.includes('no viable')) return false;
+  if (type.includes('fallback')) return false;
+  if (/fallback|educational|not\s+seller[-\s]?facing|non[-\s]?marketable|not\s+marketable/.test(justification)) return false;
+
+  return true;
+}
+
+function creativeOpennessPoints({ stance, executionContext }) {
+  if (stance.terms_openness === 'no_creative') return { points: 0, score_ceiling: 2, status: 'explicit_rejection' };
+  if (stance.terms_openness === 'open') return { points: 3, score_ceiling: 10, status: 'open' };
+  if (stance.terms_openness === 'maybe') return { points: 2, score_ceiling: 6, status: 'maybe' };
+  if (executionContext === 'pre_call') return { points: 1, score_ceiling: 5, status: 'not_discussed_pre_call' };
+  return { points: 1, score_ceiling: 5, status: 'not_discussed_post_call' };
+}
+
+function creativePriceAcceptancePoints({ creativePrice, listPrice, sellerFloor, valueAnchor }) {
+  const anchors = [];
+
+  if (listPrice > 0) anchors.push({ type: 'list_price', value: listPrice, ratio: creativePrice / listPrice });
+  if (valueAnchor > 0) anchors.push({ type: 'estimated_value_or_arv', value: valueAnchor, ratio: creativePrice / valueAnchor });
+  if (sellerFloor?.value >= 10000) anchors.push({ type: 'seller_floor', value: sellerFloor.value, ratio: creativePrice / sellerFloor.value });
+
+  if (!creativePrice || !anchors.length) {
+    return { points: 0, weakest_ratio: null, weakest_anchor: null, ratios: [], notes: ['No reliable creative price acceptance anchor.'] };
+  }
+
+  const weakest = anchors.reduce((a, b) => (a.ratio < b.ratio ? a : b));
+  const ratio = weakest.ratio;
+
+  let points = 0;
+  if (ratio >= 1.00) points = 2;
+  else if (ratio >= 0.95) points = 1.7;
+  else if (ratio >= 0.90) points = 1.3;
+  else if (ratio >= 0.85) points = 0.9;
+  else if (ratio >= 0.80) points = 0.6;
+  else if (ratio >= 0.70) points = 0.3;
+  else points = 0.1;
+
+  return {
+    points: round(points, 2),
+    weakest_ratio: round(ratio, 4),
+    weakest_anchor: weakest.type,
+    ratios: anchors.map(a => ({ anchor: a.type, value: round(a.value, 0), ratio: round(a.ratio, 4) })),
+    notes: [`DSCR-valid creative offer is ${pct(ratio * 100)} of ${weakest.type}.`]
+  };
+}
+
+function creativeAcceptanceCeiling({ weakestRatio, stance, executionContext, publicMotivationScore }) {
+  if (weakestRatio === null || weakestRatio === undefined) {
+    return { score_ceiling: 6, reasons: ['Acceptance likelihood ceiling 6/10: missing price acceptance anchor.'] };
+  }
+
+  const confirmedExtremeMotivation =
+    executionContext === 'post_call' &&
+    stance.urgency_band === 'critical' &&
+    (stance.price_flexibility === 'flexible' || stance.terms_openness === 'open');
+
+  const confirmedStrongMotivation =
+    executionContext === 'post_call' &&
+    (stance.urgency_band === 'high' || stance.price_flexibility === 'flexible' || stance.terms_openness === 'open');
+
+  const preCallStrongPublicSignals = executionContext === 'pre_call' && publicMotivationScore >= 70;
+
+  const reasons = [];
+  let ceiling = 10;
+
+  if (weakestRatio < 0.70) {
+    if (confirmedExtremeMotivation) {
+      ceiling = 6;
+      reasons.push('Acceptance likelihood ceiling 6/10: offer pencils DSCR but requires a very large seller concession; extreme post-call motivation keeps it viable.');
+    } else if (confirmedStrongMotivation) {
+      ceiling = 5;
+      reasons.push('Acceptance likelihood ceiling 5/10: offer pencils DSCR but is below 70% of list/value; strong seller signals prevent a lower score.');
+    } else {
+      ceiling = 3;
+      reasons.push('Acceptance likelihood ceiling 3/10: offer pencils DSCR but is below 70% of list/value with no confirmed extreme motivation.');
+    }
+  } else if (weakestRatio < 0.80) {
+    if (confirmedExtremeMotivation) {
+      ceiling = 7;
+      reasons.push('Acceptance likelihood ceiling 7/10: offer pencils DSCR and seller has extreme motivation, but price still requires a major concession.');
+    } else if (confirmedStrongMotivation || preCallStrongPublicSignals) {
+      ceiling = 6;
+      reasons.push('Acceptance likelihood ceiling 6/10: offer pencils DSCR but is 70-79% of list/value; motivation signals make it worth pursuing.');
+    } else {
+      ceiling = 4;
+      reasons.push('Acceptance likelihood ceiling 4/10: offer pencils DSCR but is 70-79% of list/value and likely requires a major seller concession.');
+    }
+  } else if (weakestRatio < 0.90) {
+    if (confirmedStrongMotivation || preCallStrongPublicSignals) {
+      ceiling = 8;
+      reasons.push('Acceptance likelihood ceiling 8/10: offer pencils DSCR and is 80-89% of list/value with supporting motivation/flexibility signals.');
+    } else {
+      ceiling = 6;
+      reasons.push('Acceptance likelihood ceiling 6/10: offer pencils DSCR but is 80-89% of list/value without strong motivation/flexibility.');
+    }
+  } else if (weakestRatio < 0.95) {
+    ceiling = 8;
+    reasons.push('Acceptance likelihood ceiling 8/10: offer pencils DSCR and is 90-94% of list/value.');
+  } else {
+    ceiling = 10;
+    reasons.push('No price-based acceptance ceiling: offer is close to list/value or better.');
+  }
+
+  return { score_ceiling: ceiling, reasons };
+}
+
+function downPaymentPoints({ downPayment, purchasePrice, sellerMinDown }) {
+  if (!purchasePrice || purchasePrice <= 0) return { points: 0, ratio: null, basis: 'missing_purchase_price' };
+
+  if (sellerMinDown > 0) {
+    const ratio = downPayment / sellerMinDown;
+    if (ratio >= 1) return { points: 2, ratio: round(ratio, 4), basis: 'seller_minimum_down_payment' };
+    if (ratio >= 0.80) return { points: 1, ratio: round(ratio, 4), basis: 'seller_minimum_down_payment' };
+    if (ratio >= 0.50) return { points: 0.5, ratio: round(ratio, 4), basis: 'seller_minimum_down_payment' };
+    return { points: 0, ratio: round(ratio, 4), basis: 'seller_minimum_down_payment' };
+  }
+
+  const dpPct = downPayment / purchasePrice;
+  if (dpPct >= 0.10) return { points: 2, ratio: round(dpPct, 4), basis: 'target_down_pct' };
+  if (dpPct >= 0.05) return { points: 1, ratio: round(dpPct, 4), basis: 'target_down_pct' };
+  if (dpPct >= 0.01) return { points: 0.5, ratio: round(dpPct, 4), basis: 'target_down_pct' };
+  return { points: 0, ratio: round(dpPct, 4), basis: 'target_down_pct' };
+}
+
+function balloonPoints(balloonYears) {
+  const y = num(balloonYears);
+  if (y >= 5) return 1.5;
+  if (y >= 3) return 1;
+  if (y >= 1) return 0.5;
+  return 0;
+}
+
+function monthlyTermsPoints({ dscr, monthlyCF, validationPasses }) {
+  if (validationPasses === true) return 1;
+  if (dscr >= 1.28 && monthlyCF >= 0) return 1;
+  if (dscr >= 1.10 && monthlyCF >= -100) return 0.5;
+  return 0;
+}
+
+function motivationFlexConfidencePoints({ stance, executionContext, sellerFloor, publicMotivationScore }) {
+  let points = 0;
+
+  if (stance.urgency_band === 'critical' || stance.urgency_band === 'high') points += 0.2;
+  if (stance.price_flexibility === 'flexible') points += 0.2;
+  if (sellerFloor.confidence === 'high') points += 0.1;
+
+  if (executionContext === 'pre_call') {
+    if (publicMotivationScore >= 70) points += 0.1;
+    points = Math.min(points, 0.3);
+  }
+
+  return clamp(points, 0, 0.5);
+}
+
+function scoreCreativeProbability({ primaryOffer, engineStatus, stance, executionContext, listPrice, sellerFloor, transcriptExists, valueAnchor, publicMotivationScore }) {
+  const purchasePrice = firstNum(
+    primaryOffer['Purchase Price'],
+    primaryOffer.purchase_price,
+    primaryOffer.purchasePrice,
+    primaryOffer.raw?.purchasePrice,
+    primaryOffer.raw?.price
+  );
+
+  const fallbackResult = {
+    score: null,
+    score_ceiling: null,
+    raw_score: null,
+    purchase_price: purchasePrice ? round(purchasePrice, 0) : null,
+    down_payment: null,
+    down_payment_pct: null,
+    balloon_years: null,
+    dscr: firstNum(primaryOffer.DSCR, primaryOffer.dscr, primaryOffer.raw?.DSCR, primaryOffer.raw?.dscr) || null,
+    monthly_cf: firstNum(primaryOffer['Monthly Cash-flow'], primaryOffer.monthly_cash_flow, primaryOffer.monthly_cf, primaryOffer.raw?.monthlyCF, primaryOffer.raw?.monthly_cash_flow) || null,
+    weakest_price_ratio: null,
+    weakest_price_anchor: null,
+    price_ratios: [],
+    component_scores: {},
+    seller_facing: false,
+    reasons: ['Creative Probability not scored because Offer Engine marked the primary offer as fallback-only, non-marketable, non-viable, or not seller-facing.']
+  };
+
+  if (!isSellerFacingCreative(primaryOffer, engineStatus)) return fallbackResult;
+
+  if (!purchasePrice || purchasePrice <= 0) {
+    return { score: null, score_ceiling: null, seller_facing: true, reasons: ['Missing or malformed primary creative purchase price.'] };
+  }
+
+  const downPayment = firstNum(
+    primaryOffer['Down Payment ($)'],
+    primaryOffer.down_payment,
+    primaryOffer.downPayment,
+    primaryOffer['Cash to Seller'],
+    primaryOffer.cts,
+    primaryOffer.raw?.downPayment,
+    primaryOffer.raw?.cts,
+    primaryOffer.raw?.totalIn
+  );
+
+  const balloonYears = firstNum(
+    primaryOffer['Balloon Term (Years)'],
+    primaryOffer.balloon_years,
+    primaryOffer.seller_note_balloon_years,
+    primaryOffer.raw?.balloonYears
+  );
+
+  const dscr = firstNum(primaryOffer.DSCR, primaryOffer.dscr, primaryOffer.raw?.DSCR, primaryOffer.raw?.dscr);
+  const monthlyCF = firstNum(
+    primaryOffer['Monthly Cash-flow'],
+    primaryOffer.monthly_cash_flow,
+    primaryOffer.monthly_cf,
+    primaryOffer.raw?.monthlyCF,
+    primaryOffer.raw?.monthly_cash_flow
+  );
+
+  const validationPasses =
+    primaryOffer?._validation?.passes === true ||
+    primaryOffer?.validation?.passes === true ||
+    primaryOffer?.raw?._validation?.passes === true;
+
+  const validationViolations = [
+    ...(Array.isArray(primaryOffer?._validation?.violations) ? primaryOffer._validation.violations : []),
+    ...(Array.isArray(primaryOffer?.validation?.violations) ? primaryOffer.validation.violations : [])
+  ];
+
+  const openness = creativeOpennessPoints({ stance, executionContext });
+  const price = creativePriceAcceptancePoints({ creativePrice: purchasePrice, listPrice, sellerFloor, valueAnchor });
+  const down = downPaymentPoints({ downPayment, purchasePrice, sellerMinDown: stance.seller_minimum_down_payment });
+  const balloon = balloonPoints(balloonYears);
+  const monthly = monthlyTermsPoints({ dscr, monthlyCF, validationPasses });
+  const motivation = motivationFlexConfidencePoints({ stance, executionContext, sellerFloor, publicMotivationScore });
+
+  const raw = openness.points + price.points + down.points + balloon + monthly + motivation;
+  let scoreCeiling = openness.score_ceiling;
+  const reasons = [];
+
+  const priceCeiling = creativeAcceptanceCeiling({ weakestRatio: price.weakest_ratio, stance, executionContext, publicMotivationScore });
+  scoreCeiling = Math.min(scoreCeiling, priceCeiling.score_ceiling);
+
+  reasons.push('Creative offer is still generated because it pencils DSCR; this score only measures seller acceptance likelihood.');
+  reasons.push(`Seller openness: ${openness.points}/3 (${openness.status}).`);
+  reasons.push(`Creative price acceptance: ${price.points}/2.`);
+  reasons.push(`Down payment fit: ${down.points}/2.`);
+  reasons.push(`Balloon quality: ${balloon}/1.5.`);
+  reasons.push(`Monthly/terms acceptability: ${monthly}/1.`);
+  reasons.push(`Motivation/flex/confidence: ${round(motivation, 2)}/0.5.`);
+
+  price.notes.forEach(r => reasons.push(r));
+  priceCeiling.reasons.forEach(r => reasons.push(r));
+
+  if (stance.terms_openness === 'no_creative') {
+    scoreCeiling = Math.min(scoreCeiling, 2);
+    reasons.push('Acceptance likelihood ceiling 2/10: seller explicitly rejected creative / terms.');
+  }
+
+  if (!stance.creative_discussed || openness.status.includes('not_discussed')) {
+    scoreCeiling = Math.min(scoreCeiling, 5);
+    reasons.push('Acceptance likelihood ceiling 5/10: creative was not discussed.');
+  }
+
+  if (openness.status === 'maybe') {
+    scoreCeiling = Math.min(scoreCeiling, 6);
+    reasons.push('Acceptance likelihood ceiling 6/10: seller is unsure / only maybe open to creative.');
+  }
+
+  if (!listPrice && !sellerFloor.value && !valueAnchor) {
+    scoreCeiling = Math.min(scoreCeiling, 6);
+    reasons.push('Acceptance likelihood ceiling 6/10: no reliable creative price anchor.');
+  }
+
+  if (sellerFloor.confidence === 'low') {
+    scoreCeiling = Math.min(scoreCeiling, 6);
+    reasons.push('Acceptance likelihood ceiling 6/10: weak seller floor confidence.');
+  }
+
+  if (!transcriptExists && executionContext === 'pre_call') {
+    scoreCeiling = Math.min(scoreCeiling, 5);
+    reasons.push('Acceptance likelihood ceiling 5/10: pre-call execution; creative acceptance not confirmed with seller/agent.');
+  }
+
+  if (stance.seller_minimum_down_payment > 0) {
+  const downRatio = downPayment / stance.seller_minimum_down_payment;
+
+  if (downRatio < 0.50) {
+    scoreCeiling = Math.min(scoreCeiling, 4);
+    reasons.push(
+      `Acceptance likelihood ceiling 4/10: offered down payment ${money(downPayment)} is less than 50% of seller minimum down payment ${money(stance.seller_minimum_down_payment)}.`
+    );
+  } else if (downRatio < 0.80) {
+    scoreCeiling = Math.min(scoreCeiling, 5);
+    reasons.push(
+      `Acceptance likelihood ceiling 5/10: offered down payment ${money(downPayment)} is materially below seller minimum down payment ${money(stance.seller_minimum_down_payment)}.`
+    );
+  } else if (downRatio < 1.00) {
+    scoreCeiling = Math.min(scoreCeiling, 6);
+    reasons.push(
+      `Acceptance likelihood ceiling 6/10: offered down payment ${money(downPayment)} is slightly below seller minimum down payment ${money(stance.seller_minimum_down_payment)}.`
+    );
+  }}
+
+  if (dscr > 0 && dscr < 1.00) {
+    scoreCeiling = Math.min(scoreCeiling, 4);
+    reasons.push('Acceptance likelihood ceiling 4/10: creative structure appears economically non-viable with DSCR below 1.00.');
+  } else if (dscr > 0 && dscr < 1.28) {
+    scoreCeiling = Math.min(scoreCeiling, 6);
+    reasons.push('Acceptance likelihood ceiling 6/10: creative structure is below 1.28 DSCR target.');
+  }
+
+  if (validationViolations.length) {
+    scoreCeiling = Math.min(scoreCeiling, 6);
+    reasons.push(`Acceptance likelihood ceiling 6/10: offer validation issues present: ${validationViolations.join('; ')}`);
+  }
+
+  const score = clampInt(Math.min(raw, scoreCeiling), 1, 10);
+
+  return {
+    score,
+    score_ceiling: scoreCeiling,
+    raw_score: round(raw, 2),
+    purchase_price: round(purchasePrice, 0),
+    down_payment: round(downPayment, 0),
+    down_payment_pct: purchasePrice > 0 ? round((downPayment / purchasePrice) * 100, 2) : null,
+    balloon_years: balloonYears || null,
+    dscr: dscr || null,
+    monthly_cf: monthlyCF || null,
+    weakest_price_ratio: price.weakest_ratio,
+    weakest_price_anchor: price.weakest_anchor,
+    price_ratios: price.ratios,
+    seller_facing: true,
+    component_scores: {
+      seller_openness: openness.points,
+      seller_openness_status: openness.status,
+      creative_price_acceptance: price.points,
+      creative_weakest_price_ratio: price.weakest_ratio,
+      down_payment_fit: down.points,
+      down_payment_ratio: down.ratio,
+      down_payment_basis: down.basis,
+      balloon_quality: balloon,
+      monthly_terms_acceptability: monthly,
+      motivation_flexibility_confidence: round(motivation, 2)
+    },
+    reasons
+  };
+}
+
+function mapEvaluation(bestScore, manualReview) {
+  if (manualReview) return EVAL.MANUAL;
+
+  const s = Number(bestScore);
+
+  if (!Number.isFinite(s) || s <= 0) return EVAL.MANUAL;
+
+  if (s >= 9) return EVAL.HOT;
+  if (s >= 7) return EVAL.WARM;
+  if (s >= 5) return EVAL.FOLLOWUP;
+  if (s >= 3) return EVAL.COLD;
+
+  return EVAL.DEAD;
+}
+
+function detectLifecycleBypass({ root, output, customData, property, listing }) {
+  const statusBlob = lower([
+    root.status,
+    root.pipeline_status,
+    root.stage,
+    root.opportunity_status,
+    output.status,
+    output.pipeline_status,
+    output.stage,
+    property?.mls?.status,
+    property.status,
+    listing.status,
+    listing.mlsStatus,
+    customData.leadStatus,
+    customData.status,
+    customData['opportunity.stage'],
+    customData['opp.listStatus'],
+    customData['opp.mlsListStatus']
+  ].join(' '));
+
+  if (/do\s*not\s*contact|\bdnc\b/.test(statusBlob)) {
+    return { bypass: true, type: 'dnc', evaluation: EVAL.DNC, stage: STAGES.DNC, lead_score: 0, reason: 'Lifecycle/status field indicates DNC.' };
+  }
+
+  if (/closed|already\s+sold|property\s+sold|sold\s+already|cancelled|canceled|expired|withdrawn/.test(statusBlob)) {
+    return { bypass: true, type: 'dead', evaluation: EVAL.DEAD, stage: STAGES.DEAD, lead_score: 0, reason: 'Lifecycle/status field indicates sold, closed, cancelled, expired, or withdrawn.' };
+  }
+
+  if (/under\s+contract|pending|escrow|contingent/.test(statusBlob)) {
+    return { bypass: true, type: 'dead', evaluation: EVAL.DEAD, stage: STAGES.DEAD, lead_score: 0, reason: 'Lifecycle/status field indicates pending, escrow, contingent, or under contract.' };
+  }
+
+  return { bypass: false, type: null, evaluation: null, stage: null, lead_score: null, reason: null };
+}
+
+function getHardStop(blob, executionContext) {
+  if (/do\s*not\s*contact|\bdnc\b/.test(blob)) return 'dnc';
+
+  if (executionContext !== 'post_call') return null;
+
+  if (/already\s+sold|property\s+is\s+sold|property\s+sold|closed\s+already|went\s+under\s+contract|under\s+contract\s+already/.test(blob)) {
+    return 'dead';
+  }
+
+  if (/not\s+interested|no\s+interest|stop\s+calling|remove\s+me|take\s+me\s+off/.test(blob)) {
+    return 'not_interested';
+  }
+
+  return null;
+}
+
+function detectOfferAdjustmentOpportunity({
+  executionContext,
+  stance,
+  primaryOffer,
+  creativeProbability,
+  listPrice
+}) {
+  const purchasePrice = firstNum(
+    primaryOffer?.['Purchase Price'],
+    primaryOffer?.purchase_price,
+    primaryOffer?.purchasePrice,
+    primaryOffer?.raw?.purchasePrice,
+    primaryOffer?.raw?.price
+  );
+
+  const currentCTS = firstNum(
+    primaryOffer?.['Cash to Seller'],
+    primaryOffer?.['CTS ($)'],
+    primaryOffer?.cts,
+    primaryOffer?.raw?.cts,
+    primaryOffer?.raw?.cashToSeller,
+    primaryOffer?.raw?.downPayment
+  );
+
+  const sellerMinDown = num(stance?.seller_minimum_down_payment);
+
+  const anchorPrice = firstNum(listPrice, purchasePrice);
+  const normalEntryCap = anchorPrice > 0 ? anchorPrice * 0.15 : 0;
+  const stretchEntryCap = anchorPrice > 0 ? anchorPrice * 0.20 : 0;
+
+  const sellerOpenToTerms =
+    stance?.terms_openness === 'open' ||
+    stance?.terms_openness === 'maybe';
+
+  const currentOfferMissesSellerDown =
+    sellerMinDown > 0 &&
+    currentCTS >= 0 &&
+    currentCTS < sellerMinDown;
+
+  const sellerMinDownPotentiallyWorkable =
+    sellerMinDown > 0 &&
+    (
+      normalEntryCap <= 0 ||
+      sellerMinDown <= normalEntryCap ||
+      sellerMinDown <= stretchEntryCap
+    );
+
+  const creativePencils =
+    creativeProbability?.seller_facing === true &&
+    num(creativeProbability?.dscr) >= 1.20 &&
+    num(creativeProbability?.monthly_cf) >= 0;
+
+  const needed =
+    executionContext === 'post_call' &&
+    sellerOpenToTerms &&
+    currentOfferMissesSellerDown &&
+    sellerMinDownPotentiallyWorkable &&
+    creativePencils;
+
+  return {
+    needed,
+    type: needed ? 'seller_minimum_down_payment_gap' : null,
+    seller_minimum_down_payment: sellerMinDown || null,
+    current_cash_to_seller: currentCTS || null,
+    down_payment_gap: needed ? round(sellerMinDown - currentCTS, 0) : null,
+    normal_entry_cap: normalEntryCap ? round(normalEntryCap, 0) : null,
+    stretch_entry_cap: stretchEntryCap ? round(stretchEntryCap, 0) : null,
+    reason: needed
+      ? `Seller appears conditionally open to creative, but current CTS ${money(currentCTS)} is below seller minimum down payment ${money(sellerMinDown)}. Rebuild offer before routing cold.`
+      : null
+  };
+}
+
+function dataQualityGate({ metrics, property, customData, listPrice, sellerAsk, asIsValue, arv, valueAnchor, cashOffer, primaryOffer, engineStatus }) {
+  const warnings = [];
+  const errors = [];
+
+  const rawMoneyFields = [
+    property?.list_price,
+    customData.list_price,
+    customData['opp.listPrice'],
+    customData['opp.estValue'],
+    customData['opp.estArv'],
+    primaryOffer?.['Purchase Price'],
+    primaryOffer?.['Cash to Seller']
+  ];
+
+  if (looksMalformedMoney(...rawMoneyFields)) {
+    errors.push('One or more money fields are malformed, blank-dollar, NaN, undefined, or null-like strings.');
+  }
+
+  if (!listPrice && !sellerAsk && !asIsValue && !arv && !valueAnchor) {
+    errors.push('No meaningful price/value anchor exists.');
+  }
+
+  const listArvRatio = highLowRatio(listPrice, arv);
+  if (listPrice > 0 && arv > 0 && listArvRatio >= 3) {
+    errors.push(`List price and ARV are materially contradictory (${money(listPrice)} vs ${money(arv)}; ${round(listArvRatio, 2)}x spread).`);
+  } else if (listPrice > 0 && arv > 0 && listArvRatio >= 1.75) {
+    warnings.push(`List price and ARV have a large spread (${money(listPrice)} vs ${money(arv)}; ${round(listArvRatio, 2)}x spread).`);
+  }
+
+  const asIsArvRatio = highLowRatio(asIsValue, arv);
+  if (asIsValue > 0 && arv > 0 && asIsArvRatio >= 3) {
+    errors.push(`As-is value and ARV are materially contradictory (${money(asIsValue)} vs ${money(arv)}; ${round(asIsArvRatio, 2)}x spread).`);
+  } else if (asIsValue > 0 && arv > 0 && asIsArvRatio >= 1.75) {
+    warnings.push(`As-is value and ARV have a large spread (${money(asIsValue)} vs ${money(arv)}; ${round(asIsArvRatio, 2)}x spread).`);
+  }
+
+  const selectedCompsCount = firstNum(metrics.selected_comps_valid_count, metrics.selected_comps_count);
+  const arvSource = lower(metrics.arv_source);
+  if (arv > 0 && selectedCompsCount === 0 && /fallback|comps_api_price_fallback/.test(arvSource)) {
+    warnings.push('ARV came from fallback source with no selected usable comps.');
+  }
+
+  const sqft = firstNum(metrics.sqft, metrics.squareFootage, property.sqft, property.squareFootage, customData.squarefootage, customData.sqft);
+  if (listPrice >= 1000000 && sqft <= 0) {
+    errors.push('High-value listing is missing usable square footage, making valuation/rent/ARV unreliable.');
+  }
+
+  if (listPrice >= 1000000 && selectedCompsCount === 0 && arv > 0) {
+    warnings.push('High-value/niche property has no selected comps. Manual valuation review is recommended.');
+  }
+
+  if (cashOffer > 0 && listPrice > 0 && cashOffer / listPrice < 0.25) {
+    warnings.push(`Cash offer is less than 25% of list price (${pct((cashOffer / listPrice) * 100)} of list).`);
+  }
+
+  if (engineStatus?.seller_facing_allowed === false && engineStatus?.primary_viable === false && !cashOffer) {
+    warnings.push('Offer Engine marked creative non-seller-facing/non-viable and no usable cash offer exists.');
+  }
+
+  let severity = 'clear';
+  if (warnings.length) severity = 'warning';
+  if (errors.length) severity = 'error';
+
+  return {
+    version: 'v5.4-data-quality-gate',
+    severity,
+    should_manual_review: errors.length > 0,
+    errors,
+    warnings,
+    anchor_snapshot: {
+      list_price: listPrice || null,
+      seller_ask: sellerAsk || null,
+      as_is_value: asIsValue || null,
+      arv: arv || null,
+      value_anchor: valueAnchor || null,
+      cash_offer: cashOffer || null,
+      sqft: sqft || null,
+      selected_comps_count: selectedCompsCount || null,
+      arv_source: metrics.arv_source || null,
+      as_is_value_source: metrics.as_is_value_source || null,
+      as_is_value_confidence: metrics.as_is_value_confidence || null
+    }
+  };
+}
+
+function chooseBestScore(cashScore, creativeScore) {
+  if (cashScore !== null && creativeScore !== null) {
+    return creativeScore >= cashScore
+      ? { bestScore: creativeScore, bestPath: 'creative' }
+      : { bestScore: cashScore, bestPath: 'cash' };
+  }
+
+  if (cashScore !== null) return { bestScore: cashScore, bestPath: 'cash' };
+  if (creativeScore !== null) return { bestScore: creativeScore, bestPath: 'creative' };
+  return { bestScore: 0, bestPath: 'none' };
+}
+
+function normalizeHardStopForRouting({ hardStop, executionContext, hardStopBlob }) {
+  const blob = lower(hardStopBlob || '');
+
+  if (!hardStop) return null;
+
+  if (hardStop === 'dnc') return 'dnc';
+
+  if (hardStop === 'dead') {
+    return executionContext === 'post_call' ? 'dead' : null;
+  }
+
+  if (hardStop !== 'not_interested') return hardStop;
+
+  if (executionContext !== 'post_call') return null;
+
+  const conditionalInterest =
+    /\bunless\b/.test(blob) ||
+    /\bif\b.{0,80}\b(offer|down|payment|price|terms|conditions)\b/.test(blob) ||
+    /\bat least\b.{0,40}\bdown\b/.test(blob) ||
+    /\bminimum\b.{0,40}\bdown\b/.test(blob) ||
+    /\bdown payment\b/.test(blob) ||
+    /\blow down\b/.test(blob) ||
+    /\binsufficient initial cash\b/.test(blob) ||
+    /\bnot receptive to low\b/.test(blob) ||
+    /\bnot interested because\b/.test(blob) ||
+    /\bnot interested due to\b/.test(blob) ||
+    /\bwould consider\b/.test(blob) ||
+    /\bmight consider\b/.test(blob) ||
+    /\bopen\b.{0,60}\bterms\b/.test(blob) ||
+    /\bit can be\b/.test(blob) ||
+    /\bsend\b.{0,40}\bbest offer\b/.test(blob);
+
+  if (conditionalInterest) return null;
+
+  const trueNotInterested =
+    /\bnot interested in selling\b/.test(blob) ||
+    /\bnot interested in moving forward\b/.test(blob) ||
+    /\bdoes not want to sell\b/.test(blob) ||
+    /\bdoesn't want to sell\b/.test(blob) ||
+    /\bno longer selling\b/.test(blob) ||
+    /\bdecided not to sell\b/.test(blob) ||
+    /\bremove me\b/.test(blob) ||
+    /\btake me off\b/.test(blob) ||
+    /\bstop calling\b/.test(blob) ||
+    /\bdon'?t call\b/.test(blob) ||
+    /\bdo not call\b/.test(blob) ||
+    /\bdeclined\b.{0,40}\boffer\b/.test(blob) ||
+    /\brejected\b.{0,40}\boffer\b/.test(blob) ||
+    /\bwill not entertain\b.{0,40}\boffer/.test(blob);
+
+  return trueNotInterested ? 'not_interested' : null;
+}
+
+function finalizeRouting({
+  lifecycle,
+  dataQuality,
+  executionContext,
+  hardStop,
+  hardStopBlob = '',
+  manualReview,
+  manualReviewReasons,
+  bestScore
+}) {
+  const routingHardStop = normalizeHardStopForRouting({
+    hardStop,
+    executionContext,
+    hardStopBlob
+  });
+
+  const suppressedHardStop =
+    hardStop && hardStop !== routingHardStop ? hardStop : null;
+
+  if (lifecycle?.bypass) {
+    return {
+      evaluation: lifecycle.evaluation,
+      nextStage: lifecycle.stage,
+      score100: lifecycle.lead_score,
+      manualReview: false,
+      manualReviewReasons: [],
+      bestScore,
+      lifecycle_bypass: lifecycle,
+      data_quality_gate: dataQuality,
+      router_guard_version: SCORING_VERSION,
+      hard_stop: routingHardStop,
+      suppressed_hard_stop: suppressedHardStop
+    };
+  }
+
+  if (dataQuality?.should_manual_review) {
+    manualReview = true;
+
+    if (Array.isArray(dataQuality.errors)) {
+      dataQuality.errors.forEach(e => {
+        manualReviewReasons.push(`Data quality: ${e}`);
+      });
+    }
+  }
+
+  let evaluation = mapEvaluation(bestScore, manualReview);
+
+  if (routingHardStop === 'dnc') {
+    evaluation = EVAL.DNC;
+
+    return {
+      evaluation,
+      nextStage: STAGES.DNC,
+      score100: 0,
+      manualReview,
+      manualReviewReasons,
+      bestScore,
+      lifecycle_bypass: lifecycle,
+      data_quality_gate: dataQuality,
+      router_guard_version: SCORING_VERSION,
+      hard_stop: routingHardStop,
+      suppressed_hard_stop: suppressedHardStop
+    };
+  }
+
+  if (executionContext === 'post_call' && routingHardStop === 'dead') {
+    evaluation = EVAL.DEAD;
+  }
+
+  if (executionContext === 'post_call' && routingHardStop === 'not_interested') {
+    evaluation = EVAL.COLD;
+  }
+
+  const nextStage = routeStage({
+    evaluation,
+    executionContext,
+    hardStop: routingHardStop
+  });
+
+  const score100 = manualReview ? null : bestScore * 10;
+
+  return {
+    evaluation,
+    nextStage,
+    score100,
+    manualReview,
+    manualReviewReasons,
+    bestScore,
+    lifecycle_bypass: lifecycle,
+    data_quality_gate: dataQuality,
+    router_guard_version: SCORING_VERSION,
+    hard_stop: routingHardStop,
+    suppressed_hard_stop: suppressedHardStop
+  };
+}
+
+function hasConditionalCreativeRejectionContext(blob) {
+  const text = lower(blob);
+
+  return (
+    /unless.{0,80}(down|down payment|cash to seller|upfront|initial)/.test(text) ||
+    /minimum.{0,80}(down|down payment|cash to seller|upfront|initial)/.test(text) ||
+    /at least.{0,80}(down|down payment|cash to seller|upfront|initial)/.test(text) ||
+    /(not interested|probably not interested|no interest).{0,120}(unless|if|at least|minimum|down payment|cash to seller|upfront|initial)/.test(text) ||
+    /(creative|seller finance|subject to|subto|hybrid|terms).{0,120}(unless|minimum|at least|down payment|cash to seller|upfront|initial)/.test(text)
+  );
+}
+
+function getHardStop(blob, executionContext) {
+  const text = lower(blob);
+
+  if (/do\s*not\s*contact|\bdnc\b|stop\s+calling|remove\s+me|take\s+me\s+off/.test(text)) {
+    return 'dnc';
+  }
+
+  // Pre-call should not infer sold/not-interested from public text or generated scripts.
+  if (executionContext !== 'post_call') return null;
+
+  if (/already\s+sold|property\s+is\s+sold|property\s+sold|closed\s+already|sold\s+already/.test(text)) {
+    return 'dead';
+  }
+
+  if (/went\s+under\s+contract|under\s+contract\s+already|already\s+under\s+contract|in\s+escrow|pending\s+sale/.test(text)) {
+    return 'dead';
+  }
+
+  // Important:
+  // Do NOT treat "not interested unless you bring $25k down" as a hard stop.
+  // That is conditional seller feedback, not a dead/not-interested lead.
+  if (hasConditionalCreativeRejectionContext(text)) {
+    return null;
+  }
+
+  if (
+    /seller\s+is\s+not\s+interested/.test(text) ||
+    /they\s+are\s+not\s+interested/.test(text) ||
+    /he\s+is\s+not\s+interested/.test(text) ||
+    /she\s+is\s+not\s+interested/.test(text) ||
+    /not\s+interested\s+in\s+selling/.test(text) ||
+    /no\s+longer\s+interested/.test(text) ||
+    /does\s+not\s+want\s+to\s+sell/.test(text) ||
+    /doesn't\s+want\s+to\s+sell/.test(text) ||
+    /do\s+not\s+want\s+to\s+sell/.test(text) ||
+    /don't\s+want\s+to\s+sell/.test(text)
+  ) {
+    return 'not_interested';
+  }
+
+  return null;
+}
+
+function detectOfferAdjustmentOpportunity({
+  executionContext,
+  stance,
+  primaryOffer,
+  creativeProbability,
+  listPrice
+}) {
+  const purchasePrice = firstNum(
+    primaryOffer?.['Purchase Price'],
+    primaryOffer?.purchase_price,
+    primaryOffer?.purchasePrice,
+    primaryOffer?.raw?.purchasePrice,
+    primaryOffer?.raw?.price
+  );
+
+  const currentCTS = firstNum(
+    primaryOffer?.['Cash to Seller'],
+    primaryOffer?.['CTS ($)'],
+    primaryOffer?.cts,
+    primaryOffer?.raw?.cts,
+    primaryOffer?.raw?.cashToSeller,
+    primaryOffer?.raw?.downPayment
+  );
+
+  const sellerMinDown = num(stance?.seller_minimum_down_payment);
+
+  const anchorPrice = firstNum(listPrice, purchasePrice);
+  const normalEntryCap = anchorPrice > 0 ? anchorPrice * 0.15 : 0;
+  const stretchEntryCap = anchorPrice > 0 ? anchorPrice * 0.20 : 0;
+
+  const sellerOpenToTerms =
+    stance?.terms_openness === 'open' ||
+    stance?.terms_openness === 'maybe';
+
+  const currentOfferMissesSellerDown =
+    sellerMinDown > 0 &&
+    currentCTS >= 0 &&
+    currentCTS < sellerMinDown;
+
+  const sellerMinDownPotentiallyWorkable =
+    sellerMinDown > 0 &&
+    (
+      normalEntryCap <= 0 ||
+      sellerMinDown <= normalEntryCap ||
+      sellerMinDown <= stretchEntryCap
+    );
+
+  const creativePencils =
+    creativeProbability?.seller_facing === true &&
+    num(creativeProbability?.dscr) >= 1.20 &&
+    num(creativeProbability?.monthly_cf) >= 0;
+
+  const needed =
+    executionContext === 'post_call' &&
+    sellerOpenToTerms &&
+    currentOfferMissesSellerDown &&
+    sellerMinDownPotentiallyWorkable &&
+    creativePencils;
+
+  return {
+    needed,
+    type: needed ? 'seller_minimum_down_payment_gap' : null,
+    seller_minimum_down_payment: sellerMinDown || null,
+    current_cash_to_seller: currentCTS || null,
+    down_payment_gap: needed ? round(sellerMinDown - currentCTS, 0) : null,
+    normal_entry_cap: normalEntryCap ? round(normalEntryCap, 0) : null,
+    stretch_entry_cap: stretchEntryCap ? round(stretchEntryCap, 0) : null,
+    reason: needed
+      ? `Seller appears conditionally open to creative, but current CTS ${money(currentCTS)} is below seller minimum down payment ${money(sellerMinDown)}. Rebuild offer before routing cold.`
+      : null
+  };
+}
+
+
+const results = [];
+
+for (const item of $input.all()) {
+  try {
+    const root = item.json || {};
+    const output = isObj(root.output) ? root.output : {};
+
+    const metrics = root.metrics || output.metrics || {};
+    const property = root.property || output.property || {};
+    const canonical = root.canonical || output.canonical || {};
+    const resolved = root.resolved || output.resolved || {};
+    const listing = root.listing || output.listing || root.sale_listing_source || output.sale_listing_source || {};
+    const engineStatus = root.engine_status || output.engine_status || {};
+
+    const webhook = getNode('Start Webhook1', {});
+    const customData =
+      root.webhook_custom_data ||
+      root.customData ||
+      root.body?.customData ||
+      webhook.body?.customData ||
+      {};
+
+    const transcript = extractTranscript(root, output);
+    const cleanTranscript = cleanTranscriptForSellerEvidence(transcript);
+    const transcriptExists = hasRealTranscript(cleanTranscript);
+    const executionContext = normalizeExecutionContext(root, output, cleanTranscript);
+
+    const primaryOffer = extractOffer(root, output, 'Primary Offer');
+    const cashOfferObj = extractOffer(root, output, 'Updated Cash Offer');
+
+    const listPrice = firstNum(
+      metrics.list_price,
+      metrics.asking_price,
+      metrics.price,
+      property.list_price,
+      property?.mls?.price_num,
+      listing.listPrice,
+      listing.price,
+      customData.listPrice,
+      customData.price,
+      customData.mlsListPrice,
+      customData['opp.listPrice'],
+      customData.list_price,
+      root.monetaryValue
+    );
+
+    const sellerAsk = firstNum(
+      customData.seller_asking_price,
+      customData.sellerAsk,
+      customData.askingPrice,
+      customData.asking_price,
+      cleanTranscript.price,
+      cleanTranscript.sellerAskingPrice,
+      cleanTranscript.seller_asking_price
+    );
+
+    const arv = firstNum(
+      metrics.arv,
+      root.estimated_arv,
+      output.estimated_arv,
+      property.arv,
+      property.arv_value,
+      customData['opp.estArv'],
+      root.ARV,
+      output.ARV
+    );
+
+    const asIsValue = firstNum(
+      metrics.as_is_value,
+      property.as_is_value,
+      property.est_value,
+      property.estimatedValue,
+      property.estimated_value,
+      root.as_is_value,
+      output.as_is_value,
+      customData['opp.estValue'],
+      resolved.source_assumptions?.est_value
+    );
+
+    const valueAnchor = firstNum(
+      asIsValue,
+      property.estimatedValue,
+      property.estimated_value,
+      property.propwireValue,
+      property.propwire_value,
+      metrics.est_value,
+      metrics.estimated_value,
+      metrics.propwire_value,
+      customData.estValue,
+      customData.estimatedValue,
+      customData.estimated_value,
+      customData.propwireValue,
+      customData.propwire_value,
+      customData.propwire_estimated_value,
+      customData['opp.estValue'],
+      root.estimated_property_value,
+      root.propwire_value,
+      output.estimated_property_value,
+      output.propwire_value,
+      arv
+    );
+
+    const cashOffer = firstNum(
+      cashOfferObj['Final Cash Offer'],
+      cashOfferObj.cash_offer,
+      cashOfferObj.cashOffer,
+      cashOfferObj.offer,
+      cashOfferObj.price,
+      cashOfferObj.raw?.cashOffer,
+      cashOfferObj.raw?.price,
+      root.cash_offer?.cash_offer,
+      output.cash_offer?.cash_offer,
+      root.mao,
+      output.mao
+    );
+
+    const dom = firstNum(
+      property.dom,
+      property.daysOnMarket,
+      listing.dom,
+      listing.daysOnMarket,
+      metrics.dom,
+      customData.dom,
+      resolved.source_assumptions?.dom
+    );
+
+    const publicText = [
+      property.mls_description,
+      property.description,
+      listing.description,
+      listing.publicRemarks,
+      customData.mlsDescription,
+      JSON.stringify(customData || {}),
+      JSON.stringify(resolved || {})
+    ].join(' ');
+
+    const lifecycle = detectLifecycleBypass({ root, output, customData, property, listing });
+
+    const stance = inferSellerStance({ transcript: cleanTranscript, executionContext, publicText });
+    const publicMotScore = publicMotivationScore({ dom, publicText });
+    const confirmedMotScore = executionContext === 'post_call'
+      ? transcriptMotivationScore({ stance, transcript: cleanTranscript })
+      : publicMotScore;
+
+    const sellerFloor = estimateSellerFloor({
+      stance,
+      executionContext,
+      listPrice,
+      sellerAsk,
+      asIsValue,
+      arv,
+      publicMotivation: publicMotScore,
+      dom,
+      publicText
+    });
+
+    const cashProbability = scoreCashProbability({
+      cashOffer,
+      sellerFloor,
+      stance,
+      executionContext,
+      listPrice,
+      publicMotivationScore: publicMotScore,
+      transcriptExists
+    });
+
+    const creativeProbability = scoreCreativeProbability({
+      primaryOffer,
+      engineStatus,
+      stance,
+      executionContext,
+      listPrice,
+      sellerFloor,
+      transcriptExists,
+      valueAnchor,
+      publicMotivationScore: publicMotScore
+    });
+
+    const dataQuality = dataQualityGate({
+      metrics,
+      property,
+      customData,
+      listPrice,
+      sellerAsk,
+      asIsValue,
+      arv,
+      valueAnchor,
+      cashOffer,
+      primaryOffer,
+      engineStatus
+    });
+
+    const meaningfulPriceAnchorExists = !!(
+      sellerFloor.value ||
+      listPrice ||
+      sellerAsk ||
+      stance.seller_minimum_price ||
+      asIsValue ||
+      arv ||
+      valueAnchor
+    );
+
+    const hasAnyOffer = !!(
+      cashOffer ||
+      creativeProbability.purchase_price ||
+      firstNum(primaryOffer['Purchase Price'], primaryOffer.purchase_price, primaryOffer.purchasePrice, primaryOffer.raw?.purchasePrice)
+    );
+
+    const manualReviewReasons = [];
+    if (!hasAnyOffer) manualReviewReasons.push('Missing both usable cash and creative offer values.');
+    if (!meaningfulPriceAnchorExists) manualReviewReasons.push('Missing meaningful price anchors.');
+    if (cashProbability.score === null && creativeProbability.score === null) {
+      manualReviewReasons.push('Could not calculate either cash or creative probability.');
+    }
+
+    let manualReview = manualReviewReasons.length > 0;
+
+    const cashScore = cashProbability.score;
+    const creativeScore = creativeProbability.score;
+    const chosen = chooseBestScore(cashScore, creativeScore);
+    let bestScore = chosen.bestScore;
+    let bestPath = chosen.bestPath;
+
+    const hardStopBlob = [
+      transcriptText(cleanTranscript),
+      lower(root.status),
+      lower(root.pipeline_status),
+      lower(customData.leadStatus),
+      lower(customData.status)
+    ].join(' ');
+
+    const hardStop = getHardStop(hardStopBlob, executionContext);
+
+    const finalRouting = finalizeRouting({
+      lifecycle,
+      dataQuality,
+      executionContext,
+      hardStop,
+      manualReview,
+      manualReviewReasons,
+      bestScore
+    });
+
+    const evaluation = finalRouting.evaluation;
+    const nextStage = finalRouting.nextStage;
+    const score100 = finalRouting.score100;
+    manualReview = finalRouting.manualReview;
+    bestScore = finalRouting.bestScore;
+    bestPath = manualReview ? 'manual_review' : bestPath;
+
+    const acceptance = {
+      scoring_version: SCORING_VERSION,
+      execution_context: executionContext,
+
+      cash_probability: cashScore,
+      creative_probability: creativeScore,
+      best_acceptance_score: manualReview ? null : bestScore,
+      best_acceptance_path: manualReview ? 'manual_review' : bestPath,
+
+      underwriting_evaluation: evaluation.value,
+      underwriting_evaluation_label: evaluation.label,
+
+      seller_floor: {
+        value: sellerFloor.value,
+        formatted: sellerFloor.value ? money(sellerFloor.value) : null,
+        source: sellerFloor.source,
+        confidence: sellerFloor.confidence,
+        multiplier: sellerFloor.multiplier,
+        multiplier_reasons: sellerFloor.multiplier_reasons || [],
+        notes: sellerFloor.notes
+      },
+
+      seller_stance: stance,
+      public_motivation_score: round(publicMotScore, 1),
+      confirmed_or_effective_motivation_score: round(confirmedMotScore, 1),
+
+      cash_probability_breakdown: cashProbability,
+      creative_probability_breakdown: creativeProbability,
+
+      manual_review: manualReview,
+      manual_review_reasons: finalRouting.manualReviewReasons,
+
+      ignored_transcript_fields_note: 'Generated nextSteps/follow-up scripts/no-transcript placeholders are ignored as seller evidence.',
+      data_quality_gate: finalRouting.data_quality_gate,
+      lifecycle_bypass: finalRouting.lifecycle_bypass,
+      router_guard_version: finalRouting.router_guard_version,
+
+      price_anchors: {
+        list_price: listPrice || null,
+        seller_ask: sellerAsk || null,
+        seller_minimum_price: stance.seller_minimum_price || null,
+        as_is_value: asIsValue || null,
+        arv: arv || null,
+        value_anchor: valueAnchor || null,
+        dom: dom || null
+      },
+
+      offer_values: {
+        cash_offer: cashOffer || null,
+        creative_purchase_price: creativeProbability.purchase_price || null,
+        creative_down_payment: creativeProbability.down_payment || null,
+        creative_down_payment_pct: creativeProbability.down_payment_pct || null,
+        creative_balloon_years: creativeProbability.balloon_years || null,
+        creative_dscr: creativeProbability.dscr || null,
+        creative_monthly_cf: creativeProbability.monthly_cf || null,
+        creative_weakest_price_ratio: creativeProbability.weakest_price_ratio || null,
+        creative_weakest_price_anchor: creativeProbability.weakest_price_anchor || null,
+        creative_price_ratios: creativeProbability.price_ratios || [],
+        creative_seller_facing: creativeProbability.seller_facing ?? null
+      }
+    };
+
+    const explanationParts = [];
+    explanationParts.push(`Context: ${executionContext}.`);
+    explanationParts.push(`Cash Probability: ${cashScore ?? 'N/A'}/10.`);
+    explanationParts.push(`Creative Probability: ${creativeScore ?? 'N/A'}/10.`);
+    explanationParts.push(`Best path: ${acceptance.best_acceptance_path}.`);
+    explanationParts.push(`Underwriting Evaluation: ${evaluation.label}.`);
+
+    if (sellerFloor.value) {
+      explanationParts.push(`Seller floor estimated at ${money(sellerFloor.value)} from ${sellerFloor.source} (${sellerFloor.confidence} confidence).`);
+      if (sellerFloor.multiplier) explanationParts.push(`Seller floor multiplier: ${pct(sellerFloor.multiplier * 100)} of anchor.`);
+    } else {
+      explanationParts.push('No reliable seller floor was found.');
+    }
+
+    if (creativeProbability.score === null && creativeProbability.seller_facing === false) {
+      explanationParts.push('Creative Probability was not scored because the Offer Engine marked the primary creative offer as fallback-only, non-marketable, non-viable, or not seller-facing.');
+    }
+
+    if (executionContext === 'pre_call') {
+      explanationParts.push('Pre-call scoring is capped because seller motivation and flexibility are not confirmed. Pre-call can never route to Dead or Closer.');
+    } else {
+      explanationParts.push('Post-call scoring uses transcript/seller stance evidence.');
+    }
+
+    if (dataQuality.severity !== 'clear') {
+      explanationParts.push(`Data quality gate severity: ${dataQuality.severity}.`);
+    }
+
+    if (lifecycle.bypass) {
+      explanationParts.push(`Lifecycle bypass applied: ${lifecycle.reason}`);
+    }
+
+    explanationParts.push('Generated follow-up scripts and next-step instructions are ignored as seller evidence.');
+    explanationParts.push('Offer Engine still creates the DSCR-valid offer; this router only scores seller acceptance likelihood.');
+
+    if (finalRouting.manualReviewReasons.length) {
+      explanationParts.push(`Manual review reason: ${finalRouting.manualReviewReasons.join(' ')}`);
+    }
+
+    root.acceptance_scoring = acceptance;
+    root.cash_probability = cashScore;
+    root.creative_probability = creativeScore;
+    root.underwriting_evaluation = evaluation.value;
+    root.underwriting_evaluation_label = evaluation.label;
+    root.best_acceptance_score = acceptance.best_acceptance_score;
+    root.best_acceptance_path = acceptance.best_acceptance_path;
+    root.execution_context = executionContext;
+    root.seller_stance = stance;
+    root.seller_floor = acceptance.seller_floor;
+    root.leadScore = score100;
+    root.lead_score = score100;
+    root.lead_score_version = SCORING_VERSION;
+    root.lead_score_explanation = explanationParts.join(' ');
+    root.precall_priority_score = executionContext === 'pre_call' ? score100 : null;
+    root.postcall_actionability_score = executionContext === 'post_call' ? score100 : null;
+    root.data_quality_gate = dataQuality;
+    root.lifecycle_bypass = lifecycle;
+
+    root.recommendation = {
+      evaluation: evaluation.label,
+      underwritingEvaluation: evaluation.value,
+      nextPipelineStage: nextStage,
+      stage_version: SCORING_VERSION,
+      readyForCloserCall: nextStage === STAGES.CLOSER,
+      execution_context: executionContext,
+      cash_probability: cashScore,
+      creative_probability: creativeScore,
+      best_acceptance_score: acceptance.best_acceptance_score,
+      best_acceptance_path: acceptance.best_acceptance_path,
+      seller_floor: acceptance.seller_floor,
+      seller_stance: stance,
+      manual_review: manualReview,
+      manual_review_reasons: finalRouting.manualReviewReasons,
+      data_quality_gate: dataQuality,
+      lifecycle_bypass: lifecycle,
+      summary: root.lead_score_explanation,
+      routingNotes: {
+        pre_call_rule: executionContext === 'pre_call'
+          ? 'Pre-call leads do not route directly to Closer Call and can never route to Dead.'
+          : null,
+        post_call_rule: executionContext === 'post_call'
+          ? 'Post-call leads can route to Closer Call when seller acceptance score is Hot and no hard stop exists.'
+          : null,
+        offer_engine_rule: 'Offer Engine should still generate the offer that pencils DSCR. This router only scores likelihood of seller acceptance.',
+        transcript_sanitization_rule: 'Generated follow-up scripts, nextSteps, task notes, and no-transcript placeholders are ignored as seller evidence.',
+        data_quality_gate_rule: 'Bad/missing/contradictory anchors force Manual Review instead of confident automation routing.',
+        lifecycle_bypass_rule: 'DNC/sold/closed/pending/escrow/under-contract statuses bypass normal scoring when detected.',
+        hard_stop: hardStop || null
+      }
+    };
+
+    root.output = {
+      ...(root.output || {}),
+      acceptance_scoring: acceptance,
+      cash_probability: cashScore,
+      creative_probability: creativeScore,
+      underwriting_evaluation: evaluation.value,
+      underwriting_evaluation_label: evaluation.label,
+      best_acceptance_score: acceptance.best_acceptance_score,
+      best_acceptance_path: acceptance.best_acceptance_path,
+      leadScore: score100,
+      lead_score: score100,
+      lead_score_version: SCORING_VERSION,
+      lead_score_explanation: root.lead_score_explanation,
+      execution_context: executionContext,
+      precall_priority_score: root.precall_priority_score,
+      postcall_actionability_score: root.postcall_actionability_score,
+      seller_stance: stance,
+      seller_floor: acceptance.seller_floor,
+      data_quality_gate: dataQuality,
+      lifecycle_bypass: lifecycle,
+      recommendation: root.recommendation
+    };
+
+    results.push({ json: root });
+  } catch (e) {
+    results.push({
+      json: {
+        ...(item.json || {}),
+        cash_probability: null,
+        creative_probability: null,
+        underwriting_evaluation: EVAL.MANUAL.value,
+        underwriting_evaluation_label: EVAL.MANUAL.label,
+        leadScore: null,
+        lead_score: null,
+        lead_score_version: SCORING_VERSION,
+        lead_score_explanation: `Scoring error: ${e?.message || String(e)}`,
+        acceptance_scoring: {
+          scoring_version: SCORING_VERSION,
+          manual_review: true,
+          manual_review_reasons: [`Scoring error: ${e?.message || String(e)}`]
+        },
+        recommendation: {
+          evaluation: EVAL.MANUAL.label,
+          underwritingEvaluation: EVAL.MANUAL.value,
+          nextPipelineStage: STAGES.UNDERWRITER,
+          stage_version: SCORING_VERSION,
+          readyForCloserCall: false,
+          routingReason: 'scoring_error',
+          summary: `Scoring error: ${e?.message || String(e)}`
+        }
+      }
+    });
+  }
+}
+
+return results;
