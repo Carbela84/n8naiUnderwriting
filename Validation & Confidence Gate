@@ -1,0 +1,414 @@
+
+
+// Validation & Confidence Gate — Sprint 2
+// Goal:
+// 1) Block obviously broken underwriting from publishing
+// 2) Separate hard blockers from softer confidence warnings
+// 3) Preserve internal logging while tightening external publish safety
+
+function safeNode(name, fallback = {}) {
+  try {
+    const v = $(name).first().json;
+    return v ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function num(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+
+  const cleaned = String(v).replace(/[^\d.-]/g, '').trim();
+
+  if (!cleaned || cleaned === '.' || cleaned === '-' || cleaned === '-.') {
+    return null;
+  }
+
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+function txt(v) {
+  return String(v ?? '').trim();
+}
+
+function hasUnitSuffix(address) {
+  return /(?:\bapt\b|\bunit\b|#|\bsuite\b|\bste\b)/i.test(address || '');
+}
+
+function sameBucketType(a, b) {
+  const ta = txt(a).toLowerCase();
+  const tb = txt(b).toLowerCase();
+  if (!ta || !tb) return true;
+
+  const bucket = (x) => {
+    if (/multi|duplex|triplex|fourplex|quad|apartment/.test(x)) return 'multi';
+    if (/condo|condominium/.test(x)) return 'condo';
+    if (/townhouse|townhome/.test(x)) return 'townhome';
+    if (/single|sfr|single family/.test(x)) return 'single';
+    if (/mobile|manufactured/.test(x)) return 'manufactured';
+    return x;
+  };
+
+  return bucket(ta) === bucket(tb);
+}
+
+function round2(n) {
+  return Number((n || 0).toFixed(2));
+}
+
+const MIN_CONFIDENCE_TO_PUBLISH = 60;
+
+const stageNode = safeNode('Evaluation & Stage Router');
+const output = stageNode.output || stageNode || {};
+
+const metricsNode = safeNode('Compute Metrics v2');
+const metrics =   output.metrics || metricsNode.metrics || {};
+
+const property = output.property || metricsNode.property || {};
+const dealMath = safeNode('OFFER ENGINE1');
+const ds = output.deal_structure || {};
+
+const primary = ds['Primary Offer'] || {};
+const backup = ds['Backup Offer'] || {};
+const cash = ds['Updated Cash Offer'] || {};
+
+const publicRecord = safeNode('HTTP Request6');
+const normalizeNode = safeNode('Normalize Subject + Mode');
+const dedupeNode = safeNode('Deduplicate Opportunities');
+const transcriptNode = safeNode('Phone Transcript analyzer');
+
+const resolved = normalizeNode.resolved || dedupeNode.resolved || {};
+const transcriptOutput = transcriptNode.output || output.transcript || {};
+
+const validation = {
+  version: 'validator-s2.0',
+  can_publish: true,
+  errors: [],
+  warnings: [],
+  info: [],
+  checks: {},
+  confidence: {
+    score: 100,
+    tier: 'high',
+    threshold_to_publish: MIN_CONFIDENCE_TO_PUBLISH,
+    reasons: []
+  }
+};
+
+function addError(msg) {
+  validation.errors.push(msg);
+  validation.confidence.score -= 20;
+  validation.confidence.reasons.push(`ERROR: ${msg}`);
+}
+
+function addWarning(msg) {
+  validation.warnings.push(msg);
+  validation.confidence.score -= 5;
+  validation.confidence.reasons.push(`WARN: ${msg}`);
+}
+
+function addInfo(msg) {
+  validation.info.push(msg);
+}
+
+function finalizeConfidence() {
+  validation.confidence.score = Math.max(0, Math.min(100, validation.confidence.score));
+  if (validation.confidence.score >= 85) validation.confidence.tier = 'high';
+  else if (validation.confidence.score >= 60) validation.confidence.tier = 'medium';
+  else validation.confidence.tier = 'low';
+}
+
+const address =
+  txt(property.address) ||
+  txt(resolved.address_for_value_full) ||
+  txt(resolved.raw_address);
+
+const propTypeMetrics = txt(metrics.propertyType);
+const propTypeProperty = txt(property.propertyType);
+const propTypeResolved = txt(resolved.property_type_for_value);
+
+const arv = num(metrics.arv ?? property.arv_value ?? output.arv_value ?? dealMath.output?.property?.arv_value);
+const asIs = num(metrics.as_is_value ?? property.est_value);
+const listPrice = num(metrics.list_price ?? property.list_price ?? metrics.price);
+const grossRent = num(metrics.grossRent ?? metrics.gross_rent_monthly);
+const taxes = num(metrics.taxes);
+const insurance = num(metrics.insurance);
+const opex = num(metrics.opex);
+const noi = num(metrics.noi);
+const tiMonthly = num(metrics.tiMonthly);
+const equityPct = num(metrics.equity_pct);
+const loanBal = num(metricsNode.existing_loan?.balance ?? output.existing_loan?.balance ?? dealMath.existing_loan?.balance) ?? 0;
+const loanRate = num(metricsNode.existing_loan?.rate ?? output.existing_loan?.rate ?? dealMath.existing_loan?.rate) ?? 0;
+
+validation.checks.address = address;
+validation.checks.arv = arv;
+validation.checks.as_is_value = asIs;
+validation.checks.list_price = listPrice;
+validation.checks.gross_rent = grossRent;
+validation.checks.noi = noi;
+validation.checks.opex = opex;
+validation.checks.ti_monthly = tiMonthly;
+validation.checks.equity_pct = equityPct;
+
+// ------------------------------
+// 1) Core subject/data sanity
+// ------------------------------
+if (!address) addError('Missing subject address.');
+if (arv === null || arv <= 0) addError(`ARV is missing or non-positive: ${arv}`);
+if (asIs !== null && asIs < 0) addError(`As-is value is negative: ${asIs}`);
+if (listPrice !== null && listPrice < 0) addError(`List price is negative: ${listPrice}`);
+if (grossRent !== null && grossRent < 0) addError(`Gross rent is negative: ${grossRent}`);
+if (taxes !== null && taxes < 0) addError(`Taxes are negative: ${taxes}`);
+if (insurance !== null && insurance < 0) addError(`Insurance is negative: ${insurance}`);
+if (opex !== null && opex < 0) addError(`Operating expenses are negative: ${opex}`);
+if (noi !== null && noi < 0) addError(`NOI is negative: ${noi}`);
+if (tiMonthly !== null && tiMonthly < 0) addError(`TI monthly is negative: ${tiMonthly}`);
+
+if (equityPct === null) {
+  addError('equity_pct is missing or non-numeric.');
+} else {
+  if (equityPct < -100 || equityPct > 100) addError(`equity_pct out of range for percent convention: ${equityPct}`);
+  else if (equityPct > 0 && equityPct < 1) addWarning(`equity_pct looks fraction-scaled (${equityPct}). Expected 0–100 percent convention.`);
+}
+
+if (propTypeMetrics && propTypeResolved && !sameBucketType(propTypeMetrics, propTypeResolved)) {
+  addError(`Property type drift between metrics (${propTypeMetrics}) and resolved subject (${propTypeResolved}).`);
+}
+if (propTypeProperty && propTypeResolved && !sameBucketType(propTypeProperty, propTypeResolved)) {
+  addError(`Property type drift between property output (${propTypeProperty}) and resolved subject (${propTypeResolved}).`);
+}
+
+// ------------------------------
+// 2) Cash offer consistency
+// ------------------------------
+const cashAmt = num(cash['Final Cash Offer'] ?? cash.finalCashOffer);
+const cashPct = num(cash['Final Cash Offer % of ARV'] ?? cash.finalCashOfferPct);
+
+validation.checks.cash_offer_amount = cashAmt;
+validation.checks.cash_offer_pct = cashPct;
+
+if (cashAmt !== null && cashPct !== null && arv !== null && arv > 0) {
+  const impliedPct = round2((cashAmt / arv) * 100);
+  validation.checks.cash_offer_implied_pct = impliedPct;
+
+  if (Math.abs(impliedPct - cashPct) > 1.0) {
+    addError(`Updated Cash Offer mismatch: amount implies ${impliedPct}% of ARV but field says ${cashPct}%.`);
+  }
+
+  if (cashAmt > arv) {
+    addError(`Cash offer exceeds ARV: cash ${cashAmt}, ARV ${arv}.`);
+  }
+} else {
+  addWarning('Updated Cash Offer could not be fully validated (missing amount, percent, or ARV).');
+}
+
+// ------------------------------
+// 3) Multifamily / subject-scope
+// ------------------------------
+const publicUnitCount =
+  num(publicRecord.features?.unitCount) ??
+  num(publicRecord.subjectProperty?.features?.unitCount) ??
+  0;
+
+const sqft =
+  num(metrics.sqft) ??
+  num(property.sqft) ??
+  num(resolved.building_sqft) ??
+  0;
+
+if (
+  /multi|duplex|triplex|fourplex|quad|apartment/i.test(`${propTypeMetrics} ${propTypeProperty} ${propTypeResolved}`) &&
+  hasUnitSuffix(address) &&
+  (sqft > 1500 || publicUnitCount > 1)
+) {
+  addError(`Multifamily subject-scope conflict: unit-style address appears paired with building-level data for "${address}".`);
+}
+
+// ------------------------------
+// 4) Offer validation
+// ------------------------------
+function validateOffer(label, offer) {
+  const offerType = txt(offer['Type'] || offer.type);
+  const purchasePrice = num(offer['Purchase Price'] || offer.purchasePrice);
+  const down = num(offer['Down Payment ($)'] || offer.downPayment);
+  const downPct = num(offer['Down Payment (%)'] || offer.downPaymentPct);
+  const rate = num(offer['Loan Rate (%)'] || offer['Interest Rate (%)'] || offer.interestRate || offer.ratePct);
+  const payment = num(offer['Monthly Payment (PI)'] || offer['Monthly Payment'] || offer.monthlyPayment || offer.monthPI);
+  const ads = num(offer['ADS'] || offer.ads);
+  const dscr = num(offer['DSCR'] || offer.dscr);
+  const monthlyCF = num(offer['Monthly Cash-flow'] || offer.monthlyCF || offer.monthly_cash_flow);
+  const coc = num(offer['Cash-on-Cash Return'] || offer.coc || offer.coc_pct);
+  const balloon = num(offer['Balloon Term (Years)'] || offer.balloonYrs);
+
+  validation.checks[`${label.toLowerCase()}_type`] = offerType;
+
+  const result = {
+    type: offerType,
+    viable: false,
+    reasons: []
+  };
+
+  if (!offerType) {
+    addError(`${label} offer has no Type.`);
+    result.reasons.push('missing_type');
+    return result;
+  }
+
+  if (purchasePrice === null || purchasePrice <= 0) {
+    addError(`${label} offer missing Purchase Price.`);
+    result.reasons.push('missing_purchase_price');
+  }
+
+  if (down !== null && down < 0) {
+    addError(`${label} offer has invalid negative down payment.`);
+    result.reasons.push('negative_down');
+  }
+
+  if (payment !== null && payment < 0) {
+    addError(`${label} offer has invalid monthly payment.`);
+    result.reasons.push('negative_payment');
+  }
+
+  if (/seller finance/i.test(offerType)) {
+    if (rate === null || rate <= 0) {
+      addError(`${label} Seller Finance offer missing rate.`);
+      result.reasons.push('missing_rate');
+    } else if (rate > 4.0) {
+      addError(`${label} Seller Finance rate ${rate}% exceeds 4.0% max.`);
+      result.reasons.push('rate_too_high');
+    }
+
+    if (downPct !== null && downPct > 20) {
+      addError(`${label} Seller Finance down payment ${downPct}% exceeds 10% max.`);
+      result.reasons.push('down_pct_too_high');
+    }
+
+    if (balloon !== null && balloon < 5) {
+      addError(`${label} Seller Finance balloon ${balloon} years is below 5-year minimum.`);
+      result.reasons.push('balloon_too_short');
+    }
+  }
+
+  if (/subject-to|subject to/i.test(offerType)) {
+    if (loanBal <= 0) {
+      addError(`${label} Subject-To offer is incompatible with no existing loan.`);
+      result.reasons.push('no_loan_for_subto');
+    }
+
+    if (loanBal > 150000 && loanRate > 6.8) {
+      addError(`${label} Subject-To loan rate ${loanRate}% exceeds 6.8% max for loans over $150k.`);
+      result.reasons.push('loan_rate_too_high');
+    }
+
+    if (loanBal > 0 && loanBal <= 150000 && loanRate > 8) {
+      addError(`${label} Subject-To loan rate ${loanRate}% exceeds 8% max for loans under $150k.`);
+      result.reasons.push('loan_rate_too_high');
+    }
+  }
+
+  if (/hybrid/i.test(offerType)) {
+    if (loanBal <= 0) {
+      addError(`${label} Hybrid offer is incompatible with no existing loan.`);
+      result.reasons.push('no_loan_for_hybrid');
+    }
+
+    if (downPct !== null && downPct > 10) {
+      addError(`${label} Hybrid down payment ${downPct}% exceeds 10% max.`);
+      result.reasons.push('down_pct_too_high');
+    }
+  }
+
+  // DSCR consistency check
+  let impliedADS = ads;
+  if ((impliedADS === null || impliedADS <= 0) && payment !== null && payment >= 0 && tiMonthly !== null && tiMonthly >= 0) {
+    impliedADS = (payment + tiMonthly) * 12;
+  }
+
+  if (dscr !== null && impliedADS !== null && impliedADS > 0 && noi !== null && noi > 0) {
+    const impliedDSCR = round2(noi / impliedADS);
+    validation.checks[`${label.toLowerCase()}_implied_dscr`] = impliedDSCR;
+    if (Math.abs(impliedDSCR - dscr) > 0.05) {
+      addError(`${label} DSCR mismatch: field says ${dscr}, implied is ${impliedDSCR}.`);
+      result.reasons.push('dscr_mismatch');
+    }
+  }
+
+  // Viability screen
+  if (/seller finance|hybrid/i.test(offerType)) {
+    if ((dscr ?? -999) >= 1.2 && (monthlyCF ?? -999) >= 200 && (coc ?? -999) >= 13) {
+      result.viable = true;
+    } else {
+      result.reasons.push('fails_sf_hybrid_viability');
+    }
+  } else if (/subject-to|subject to/i.test(offerType)) {
+    const lowRateException = loanRate > 0 && loanRate <= 3.5;
+    const cfPass = lowRateException ? (monthlyCF ?? -999) >= -50 : (monthlyCF ?? -999) >= 150;
+    if ((dscr ?? -999) >= 1.0 && cfPass) {
+      result.viable = true;
+    } else {
+      result.reasons.push('fails_subto_viability');
+    }
+  }
+
+  return result;
+}
+
+const primaryEval = validateOffer('Primary', primary);
+const backupEval = validateOffer('Backup', backup);
+
+validation.checks.primary_offer_viable = primaryEval.viable;
+validation.checks.backup_offer_viable = backupEval.viable;
+
+// ------------------------------
+// 5) Cash viability
+// ------------------------------
+let cashViable = false;
+if (cashAmt !== null && cashAmt > 0 && arv !== null && arv > 0) {
+  if (cashAmt <= arv * 0.75) {
+    cashViable = true;
+  }
+}
+validation.checks.cash_offer_viable = cashViable;
+
+// ------------------------------
+// 6) Transcript / confidence
+// ------------------------------
+const transcriptSummary =
+  txt(transcriptOutput?.sellerUrgency) ||
+  txt(transcriptOutput?.output?.sellerUrgency) ||
+  txt(output.transcript?.output?.sellerUrgency) ||
+  txt(output.transcript_insights?.sellerUrgency);
+
+if (!transcriptSummary || /no transcript provided/i.test(transcriptSummary)) {
+  addWarning('No transcript provided. Underwriting may proceed, but seller-fit confidence is low.');
+}
+
+// ------------------------------
+// 7) Publish gating
+// ------------------------------
+if (!primaryEval.viable && !backupEval.viable && !cashViable) {
+  addError('No economically viable offer path passed validation.');
+}
+
+finalizeConfidence();
+
+validation.checks.error_count = validation.errors.length;
+validation.checks.warning_count = validation.warnings.length;
+
+validation.can_publish =
+  validation.errors.length === 0 &&
+  validation.confidence.score >= MIN_CONFIDENCE_TO_PUBLISH;
+
+validation.publish_decision = validation.can_publish
+  ? 'publish_safe'
+  : (validation.errors.length > 0
+      ? 'blocked_by_errors'
+      : 'blocked_by_low_confidence');
+
+return [{
+  json: {
+    validation
+  }
+}];
