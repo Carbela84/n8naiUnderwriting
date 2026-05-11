@@ -1,0 +1,763 @@
+/**
+ * FINAL GHL MAPPING NODE - FULL REPLACEMENT
+ *
+ * Source of truth:
+ * - Offer Engine1 / Deterministic Deal Math = ALL numeric underwriting
+ * - AI Agent = ALL narrative/explanation fields
+ * - Evaluation & Stage Router = stage / eval / lead score routing
+ * - Transcript analyzer = seller urgency / hardship / condition / next steps
+ * - Code5 = pretty notes / pretty json / LOI packaging
+ *
+ * This node also returns debug/meta so you can see:
+ * - how many contact/opportunity fields were actually mapped
+ * - which mapped friendly names had no field ID in the dictionary
+ * - which dictionary keys exist but were never used by this code
+ */
+
+function safeNode(name, fallback = {}) {
+  try {
+    const v = $(name).first().json;
+    return v ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function parseMaybeJson(v) {
+  if (v == null) return {};
+  if (typeof v === 'object') return v;
+  if (typeof v !== 'string') return {};
+  const s = v.trim();
+  if (!s) return {};
+  if (
+    (s.startsWith('{') && s.endsWith('}')) ||
+    (s.startsWith('[') && s.endsWith(']'))
+  ) {
+    try {
+      return JSON.parse(s);
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function normalizeNode(v) {
+  if (v == null) return {};
+  if (typeof v === 'object') {
+    if (v.output != null) {
+      const parsed = parseMaybeJson(v.output);
+      if (parsed && typeof parsed === 'object' && Object.keys(parsed).length) return parsed;
+      if (typeof v.output === 'object') return v.output || {};
+    }
+    return v;
+  }
+  return parseMaybeJson(v);
+}
+
+function firstValue() {
+  for (const v of arguments) {
+    if (v === 0 || v === false) return v;
+    if (v === null || v === undefined) continue;
+    if (typeof v === 'string' && v.trim() === '') continue;
+    return v;
+  }
+  return null;
+}
+
+function isBlank(v) {
+  return (
+    v === undefined ||
+    v === null ||
+    (typeof v === 'string' && (
+      v.trim() === '' ||
+      v.trim().toLowerCase() === 'undefined' ||
+      v.trim().toLowerCase() === 'null' ||
+      v.trim() === 'NaN%' ||
+      v.trim() === 'NaN'
+    )) ||
+    (Array.isArray(v) && v.length === 0)
+  );
+}
+
+function toNumber(v) {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  const n = Number(String(v).replace(/[^\d.\-]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+function money(v, digits = 0) {
+  if (v == null || v === '') return '';
+  if (typeof v === 'string' && v.trim().startsWith('$')) return v.trim();
+  const n = toNumber(v);
+  if (n == null) return String(v);
+  return `$${n.toLocaleString('en-US', {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  })}`;
+}
+
+function percent(v, digits = 1) {
+  if (v == null || v === '') return '';
+  const s = String(v).trim();
+  if (s.includes('%')) return s;
+  const n = toNumber(v);
+  if (n == null) return s;
+  return `${n.toFixed(digits)}%`;
+}
+
+function cleanText(v) {
+  return String(v == null ? '' : v)
+    .replace(/\r/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function joinBlocks() {
+  return Array.from(arguments)
+    .filter((x) => !isBlank(x))
+    .map((x) => cleanText(x))
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function nlList(arr) {
+  return (Array.isArray(arr) ? arr : [])
+    .filter((x) => !isBlank(x))
+    .map((x) => String(x).trim())
+    .join('\n');
+}
+
+function formatCompLine(c) {
+  if (!c || typeof c !== 'object') return '';
+  return cleanText(
+`Address: ${c.address || ''}
+Correlation: ${c.correlation || ''}%
+Sale Price: ${money(c.price, 0)}
+Beds: ${c.beds || ''} Baths: ${c.baths || ''}
+Sqft: ${c.squareFootage || c.sqft || ''}
+DOM: ${c.daysOnMarket || c.dom || ''}
+Distance: ${c.distance || ''}`
+  );
+}
+
+// --------------------------------------------------
+// OFFER HELPERS - MAKE MAPPING ROBUST ACROSS OFFER TYPES
+// --------------------------------------------------
+
+function normalizeOfferType(v) {
+  return String(v || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+}
+
+function offerTypeUsesCts(typeRaw) {
+  const t = normalizeOfferType(typeRaw);
+  return ['subto', 'subjectto', 'hybrid'].includes(t);
+}
+
+function offerTypeNeedsTermFields(typeRaw) {
+  const t = normalizeOfferType(typeRaw);
+
+  return (
+    t === 'hybrid' ||
+    t === 'sellerfi' ||
+    t === 'sellerfinance' ||
+    t === 'sellerfinancing' ||
+    t === 'ownerfi' ||
+    t === 'ownerfinance' ||
+    t === 'ownerfinancing'
+  );
+}
+
+function getOfferType(offerObj) {
+  return firstValue(
+    offerObj?.Type,
+    offerObj?.['Offer Type'],
+    offerObj?.offer_type
+  );
+}
+
+function getOfferPurchasePrice(offerObj) {
+  return firstValue(
+    offerObj?.['Purchase Price'],
+    offerObj?.purchase_price,
+    offerObj?.price
+  );
+}
+
+function getOfferDownPaymentDollar(offerObj) {
+  const typeRaw = getOfferType(offerObj);
+
+  if (offerTypeUsesCts(typeRaw)) {
+    return firstValue(
+      offerObj?.cts,
+      offerObj?.['Down Payment ($)'],
+      offerObj?.['Down Payment'],
+      offerObj?.down_payment
+    );
+  }
+
+  return firstValue(
+    offerObj?.['Down Payment ($)'],
+    offerObj?.['Down Payment'],
+    offerObj?.down_payment,
+    offerObj?.cts
+  );
+}
+
+function getOfferDownPaymentPct(offerObj) {
+  const typeRaw = getOfferType(offerObj);
+
+  if (offerTypeUsesCts(typeRaw)) {
+    return firstValue(
+      offerObj?.cts_pct,
+      offerObj?.['Down Payment (%)'],
+      offerObj?.['Down Payment %'],
+      offerObj?.down_payment_pct
+    );
+  }
+
+  return firstValue(
+    offerObj?.['Down Payment (%)'],
+    offerObj?.['Down Payment %'],
+    offerObj?.down_payment_pct,
+    offerObj?.cts_pct
+  );
+}
+
+function getOfferLoanRate(offerObj) {
+  return firstValue(
+    offerObj?.['Loan Rate (%)'],
+    offerObj?.['Interest Rate (%)'],
+    offerObj?.['Loan Rate %'],
+    offerObj?.['Interest Rate %'],
+    offerObj?.loan_rate_pct,
+    offerObj?.interest_rate_pct
+  );
+}
+
+function getOfferAmortizationYears(offerObj) {
+  return firstValue(
+    offerObj?.['Amortization (Years)'],
+    offerObj?.['Amortization Years'],
+    offerObj?.['Amortization'],
+    offerObj?.amortization_years
+  );
+}
+
+function getOfferBalloonTermYears(offerObj) {
+  return firstValue(
+    offerObj?.['Balloon Term (Years)'],
+    offerObj?.['Balloon Term Years'],
+    offerObj?.['Balloon Term'],
+    offerObj?.balloon_term_years
+  );
+}
+
+function getOfferMonthlyPaymentPI(offerObj) {
+  return firstValue(
+    offerObj?.['Monthly Payment (PI)'],
+    offerObj?.['Monthly Payment PI'],
+    offerObj?.monthly_payment_pi
+  );
+}
+
+function getOfferTotalEntryFee(offerObj) {
+  return firstValue(
+    offerObj?.['Total Entry Fee'],
+    offerObj?.total_entry_fee,
+    offerObj?.['Total Cash In']
+  );
+}
+
+function getOfferJustification(numObj, narrObj) {
+  return firstValue(
+    narrObj?.Justification,
+    narrObj?.justification,
+    numObj?.Justification,
+    numObj?.justification
+  );
+}
+
+// --------------------------------------------------
+// GHL SAFE FIELD NORMALIZATION
+// --------------------------------------------------
+
+function normalizeFieldValue(value) {
+  if (isBlank(value)) return null;
+
+  if (Array.isArray(value)) {
+    const flattened = value
+      .flat(Infinity)
+      .filter((v) => !isBlank(v))
+      .map((v) => {
+        if (typeof v === 'object') {
+          try {
+            return JSON.stringify(v);
+          } catch {
+            return String(v);
+          }
+        }
+        return String(v);
+      })
+      .map((v) => v.replace(/\u0000/g, '').trim())
+      .filter(Boolean);
+
+    if (!flattened.length) return null;
+    return flattened.join('\n\n');
+  }
+
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+
+  return String(value).replace(/\u0000/g, '').trim();
+}
+
+const stageRaw = safeNode('Evaluation & Stage Router', {});
+const stage = normalizeNode(stageRaw);
+
+const offerRaw = safeNode('OFFER ENGINE v1', {});
+const offer = normalizeNode(offerRaw);
+
+const aiRaw = safeNode('AI Agent', {});
+const ai = normalizeNode(aiRaw);
+
+const pretty = normalizeNode(safeNode('Code5', {}));
+const compApi = normalizeNode(safeNode('Fetch Comps API', {}));
+const rentApi = normalizeNode(safeNode('Fetch rental comps', {}));
+
+const transcriptNode = normalizeNode(safeNode('Pack Agent Input', {}));
+const transcriptOut = transcriptNode.transcript?.output || {};
+
+const idNode = normalizeNode(safeNode('Build GHL ID Dictionary', {}));
+const fieldIdsOpp = idNode.fieldIdsOpp || {};
+const fieldIdsContact = idNode.fieldIdsContact || {};
+
+const contactFields = [];
+const opportunityFields = [];
+
+const usedOppKeys = new Set();
+const usedContactKeys = new Set();
+
+const skippedNoFieldId = {
+  opportunity: [],
+  contact: []
+};
+
+const skippedNoValue = {
+  opportunity: [],
+  contact: []
+};
+
+function mapField(bucket, dict, usedSet, friendlyName, value, options = {}) {
+  const fieldId = dict[friendlyName];
+  const skipBlankAudit = options.skipBlankAudit === true;
+
+  if (!fieldId) {
+    skippedNoFieldId[bucket].push(friendlyName);
+    return;
+  }
+
+  usedSet.add(friendlyName);
+
+  const normalizedValue = normalizeFieldValue(value);
+
+  if (isBlank(normalizedValue)) {
+    if (!skipBlankAudit) {
+      skippedNoValue[bucket].push(friendlyName);
+    }
+    return;
+  }
+
+  const payload = {
+    id: String(fieldId).trim(),
+    field_value: normalizedValue
+  };
+
+  if (bucket === 'opportunity') {
+    opportunityFields.push(payload);
+  } else {
+    contactFields.push(payload);
+  }
+}
+
+function mapOpp(name, value, options = {}) {
+  mapField('opportunity', fieldIdsOpp, usedOppKeys, name, value, options);
+}
+
+function mapContact(name, value, options = {}) {
+  mapField('contact', fieldIdsContact, usedContactKeys, name, value, options);
+}
+
+// --------------------------------------------------
+// PRIMARY DATA SOURCING
+// --------------------------------------------------
+
+// stage / score / routing
+const leadScore = firstValue(
+  stageRaw.leadScore,
+  stage.leadScore,
+  stageRaw.lead_score,
+  stage.lead_score,
+  ai.lead_score,
+  offer.lead_score
+);
+
+const evaluation = firstValue(
+  stageRaw.recommendation?.evaluation,
+  stage.recommendation?.evaluation
+);
+
+const nextPipelineStage = firstValue(
+  stageRaw.recommendation?.nextPipelineStage,
+  stage.recommendation?.nextPipelineStage
+);
+
+const stageLeadExplanation = firstValue(
+  ai.lead_score_explanation,
+  stage.lead_score_explanation
+);
+
+// all numbers from offer engine
+const investors = offer.investors_analysis || {};
+const primaryOfferNum = offer.deal_structure?.['Primary Offer'] || {};
+const backupOfferNum = offer.deal_structure?.['Backup Offer'] || {};
+const cashOfferNum = offer.deal_structure?.['Updated Cash Offer'] || offer.deal_structure?.['Updated Cash offer'] || {};
+const compReport = Array.isArray(offer.comp_properties_report) ? offer.comp_properties_report : [];
+
+// all narrative from AI Agent where available
+const primaryOfferNarr = ai.deal_structure?.['Primary Offer'] || {};
+const backupOfferNarr = ai.deal_structure?.['Backup Offer'] || {};
+const cashOfferNarr = ai.deal_structure?.['Updated Cash Offer'] || ai.deal_structure?.['Updated Cash offer'] || {};
+const dispoNarr = ai.dispoStrategy || {};
+const buyerMatchSummary = firstValue(ai.buyer_match_summary, offer.buyer_match_summary);
+const compsSummaryNarr = firstValue(ai.comps_summary, offer.comps_summary);
+const investorInsightNarr = firstValue(ai.investors_analysis_insights, offer.investors_analysis_insights);
+const finalRecsNarr = firstValue(ai.finalRecommendationsAndInsights, offer.finalRecommendationsAndInsights);
+const loiHtml = firstValue(pretty.direct_to_agent_loi, ai.loi, offer.loi);
+
+// offer-type logic
+const primaryOfferType = getOfferType(primaryOfferNum);
+const backupOfferType = getOfferType(backupOfferNum);
+
+const primaryNeedsTermFields = offerTypeNeedsTermFields(primaryOfferType);
+const backupNeedsTermFields = offerTypeNeedsTermFields(backupOfferType);
+
+const primaryAmortizationYears = primaryNeedsTermFields ? getOfferAmortizationYears(primaryOfferNum) : undefined;
+const primaryBalloonTermYears = primaryNeedsTermFields ? getOfferBalloonTermYears(primaryOfferNum) : undefined;
+
+const backupAmortizationYears = backupNeedsTermFields ? getOfferAmortizationYears(backupOfferNum) : undefined;
+const backupBalloonTermYears = backupNeedsTermFields ? getOfferBalloonTermYears(backupOfferNum) : undefined;
+
+// --------------------------------------------------
+// COMPLEX TEXT BLOCKS
+// --------------------------------------------------
+
+const leadScoreExp = cleanText(
+`Underwriting Score: ${leadScore ?? ''}
+Monthly Cash Flow: ${firstValue(investors['Monthly Cash-flow'], offer.canonical?.economics?.monthlyCF) ?? ''}
+Cash on Cash: ${firstValue(investors['Cash-on-Cash Return'], offer.canonical?.economics?.CoC_pct) ?? ''}
+DSCR: ${firstValue(investors.DSCR, offer.canonical?.economics?.DSCR) ?? ''}
+
+Therefore; the recommended next stage is: ${nextPipelineStage || ''}
+
+Quick Notes: ${firstValue(
+  investorInsightNarr,
+  ai.lead_score_explanation,
+  stageLeadExplanation,
+  transcriptOut.additionalInsights,
+  pretty.pretty_summary_one_line
+) || ''}
+
+Lead Score Explanation: ${firstValue(ai.lead_score_explanation, stageLeadExplanation) || ''}`
+);
+
+let compsContext = cleanText(compsSummaryNarr || '');
+for (let i = 0; i < Math.min(3, compReport.length); i++) {
+  compsContext = joinBlocks(compsContext, formatCompLine(compReport[i]));
+}
+
+const urgencySummary = cleanText(
+`Seller Urgency: ${firstValue(transcriptOut.sellerUrgency, ai.sellerUrgency, 'No seller urgency summary available')}
+
+Seller Hardship: ${firstValue(transcriptOut.sellerHardship, ai.sellerHardship, 'No seller hardship summary available')}
+
+Property Condition: ${firstValue(transcriptOut.conditionOfProperty, ai.conditionOfProperty, 'No property condition summary available')}
+
+Price: ${firstValue(transcriptOut.price, ai.price, 'No pricing narrative available')}
+
+Additional Insights: ${firstValue(transcriptOut.additionalInsights, ai.additionalInsights, investorInsightNarr, 'No additional insights available')}
+
+Next Steps: ${firstValue(transcriptOut.nextSteps, ai.nextSteps, 'No next steps available')}
+
+Suggested Follow-Up Script (if necessary): ${firstValue(
+  transcriptOut['Suggested Follow up Script'],
+  transcriptOut['Suggested Follow-Up Script'],
+  ai['Suggested Follow up Script'],
+  ai['Suggested Follow-Up Script'],
+  'No follow-up script available'
+)}`
+);
+
+let zillowLinks = cleanText(
+`Sales and Rental Comp Zillow Links:
+
+Subject Property Link:
+https://www.zillow.com/homes/${compApi.subjectProperty?.id || ''}_rb
+
+Sales Comps:
+ARV: ${compApi.price || ''}
+Price Range: ${compApi.priceRangeLow || ''} - ${compApi.priceRangeHigh || ''}`
+);
+
+const sComps = Array.isArray(compApi.comparables) ? compApi.comparables : [];
+for (let i = 0; i < Math.min(6, sComps.length); i++) {
+  zillowLinks += `\n${i + 1}: https://www.zillow.com/homes/${sComps[i].id}_rb`;
+}
+
+zillowLinks += `\n\nRental Comps:\nAverage Rent: $${rentApi.rent || ''}\nRental Range: $${rentApi.rentRangeLow || ''}-$${rentApi.rentRangeHigh || ''}`;
+
+const rComps = Array.isArray(rentApi.comparables) ? rentApi.comparables : [];
+for (let i = 0; i < Math.min(6, rComps.length); i++) {
+  zillowLinks += `\n${i + 1}: https://www.zillow.com/homes/${rComps[i].id}_rb`;
+}
+
+const dispoText = cleanText(
+`Recommended Disposition Strategy: ${firstValue(dispoNarr.recommendedDispoStrategy, 'No disposition strategy available')}
+
+Best Type of Investor to Market this deal to: ${firstValue(dispoNarr.bestEndBuyerType, 'No buyer type available')}
+
+Projected Assignment Fee: ${firstValue(dispoNarr.projectedAssignmentFee, offer.assignment_fee_range, 'No assignment fee available')}
+
+Profit Projection Insights: ${firstValue(
+  Array.isArray(dispoNarr.endBuyerExitStrategyProfitProjections) ? dispoNarr.endBuyerExitStrategyProfitProjections[0] : null,
+  'No profit projection available'
+)}
+
+Final Recommendations: ${firstValue(finalRecsNarr, 'No final recommendations available')}`
+);
+
+const cashAmount = firstValue(
+  cashOfferNum['Final Cash Offer Amount'],
+  cashOfferNum['Final Cash Offer'],
+  cashOfferNarr['Final Cash Offer Amount'],
+  cashOfferNarr['Final Cash Offer']
+);
+
+const cashPct = firstValue(
+  cashOfferNum['Final Cash Offer % of ARV'],
+  cashOfferNarr['Final Cash Offer % of ARV']
+);
+
+const combinedCashOffer = cleanText(
+  cashAmount && cashPct ? `${cashAmount} (${cashPct})` : firstValue(cashAmount, '')
+);
+
+const prequalNotes = firstValue(
+  pretty.role_notes?.prequalifier?.text,
+  pretty.ai_underwriting_note,
+  pretty.pretty_note_ghl,
+  null
+);
+
+const fullJsonText = firstValue(
+  pretty.pretty_json,
+  JSON.stringify({
+    offer_engine: offer,
+    ai_agent: ai,
+    stage_router: stageRaw
+  })
+);
+
+// --------------------------------------------------
+// MAP TO OPPORTUNITY FIELDS
+// --------------------------------------------------
+
+mapOpp('Lead Score - Number', leadScore);
+mapOpp('Lead Score Explanation & Target Stage / Quick Notes', leadScoreExp);
+mapOpp('Prequalifier Notes', prequalNotes);
+mapOpp('Estimated ARV', firstValue(offer.estimated_arv, offer.metrics?.arv, offer.property?.arv_value));
+mapOpp('Comps Summary Context', compsContext);
+
+mapOpp('Gross Rent', investors['Gross Rent']);
+mapOpp('Annual Rent', investors['Annual Rent']);
+mapOpp('Operating Expenses', investors['Operating Expenses']);
+mapOpp('NOI', investors.NOI);
+mapOpp('Annual Debt Service - ADS', investors['Annual Debt Service (ADS)']);
+mapOpp('DSCR', investors.DSCR);
+mapOpp('Annual Cash Flow', investors['Annual Cash-flow']);
+mapOpp('Monthly Cash Flow', investors['Monthly Cash-flow']);
+mapOpp('Total Cash In / Entry Fee', investors['Total Cash In']);
+mapOpp('Cash-on-Cash Return', investors['Cash-on-Cash Return']);
+mapOpp('Cash-on-Cash Return - Alternate ID', investors['Cash-on-Cash Return']);
+mapOpp('2% Rule Pass/Fail', investors['2% Rule']);
+mapOpp('50% Rule PassFail', investors['50% Rule']);
+
+mapOpp('primary.Offer Type', primaryOfferType);
+mapOpp('primary.Purchase Price', getOfferPurchasePrice(primaryOfferNum));
+mapOpp('primary.Down Payment $', getOfferDownPaymentDollar(primaryOfferNum));
+mapOpp('primary.Down Payment %', percent(getOfferDownPaymentPct(primaryOfferNum)));
+mapOpp('primary.Loan Rate %', getOfferLoanRate(primaryOfferNum));
+mapOpp('primary.Amortization Years', primaryAmortizationYears, { skipBlankAudit: !primaryNeedsTermFields });
+mapOpp('primary.Balloon Term Years', primaryBalloonTermYears, { skipBlankAudit: !primaryNeedsTermFields });
+mapOpp('primary.Monthly Payment PI', getOfferMonthlyPaymentPI(primaryOfferNum));
+mapOpp('primary.Total Entry Fee', getOfferTotalEntryFee(primaryOfferNum));
+mapOpp('primary.Justification', getOfferJustification(primaryOfferNum, primaryOfferNarr));
+
+mapOpp('backup.Offer Type', backupOfferType);
+mapOpp('backup.Purchase Price', getOfferPurchasePrice(backupOfferNum));
+mapOpp('backup.Down Payment $', getOfferDownPaymentDollar(backupOfferNum));
+mapOpp('backup.Down Payment %', percent(getOfferDownPaymentPct(backupOfferNum)));
+mapOpp('backup.Loan Rate %', getOfferLoanRate(backupOfferNum));
+mapOpp('backup.Amortization Years', backupAmortizationYears, { skipBlankAudit: !backupNeedsTermFields });
+mapOpp('backup.Balloon Term Years', backupBalloonTermYears, { skipBlankAudit: !backupNeedsTermFields });
+mapOpp('backup.Monthly Payment PI', getOfferMonthlyPaymentPI(backupOfferNum));
+mapOpp('backup.Total Entry Fee', getOfferTotalEntryFee(backupOfferNum));
+mapOpp('backup.Justification', getOfferJustification(backupOfferNum, backupOfferNarr));
+
+mapOpp('Final Cash Offer Amount', firstValue(cashAmount, combinedCashOffer));
+mapOpp('Final Cash Offer % of ARV', cashPct);
+mapOpp('Cash Offer Justification', firstValue(cashOfferNarr.Justification, cashOfferNum.Justification));
+mapOpp('Subjective Additional Insights', firstValue(investorInsightNarr, transcriptOut.additionalInsights));
+mapOpp('Seller Urgency / Condition Summary', urgencySummary);
+mapOpp('Zillow Links for Comps', zillowLinks);
+mapOpp('Average Rent', rentApi.rent);
+mapOpp('Rent Range Low', rentApi.rentRangeLow);
+mapOpp('Rent Range High', rentApi.rentRangeHigh);
+mapOpp('Average Sale Price Comps', compApi.price);
+mapOpp('Sale Price Low', compApi.priceRangeLow);
+mapOpp('Sale Price High', compApi.priceRangeHigh);
+mapOpp('Next Pipeline Stage', nextPipelineStage);
+mapOpp('Cold/Warm/Hot Evaluation', evaluation);
+mapOpp('Current Timestamp', new Date().toISOString());
+mapOpp('Disposition Strategy & Best Buyer Type', dispoText);
+mapOpp('Direct to Agent LOI text', loiHtml);
+mapOpp('Buyer Match Summary', buyerMatchSummary ? buyerMatchSummary.replace(/\s*\|\s*/g, '\n') : undefined);
+
+// --------------------------------------------------
+// MAP TO CONTACT FIELDS
+// --------------------------------------------------
+
+mapContact('Lead Score Explanation & Target Stage / Quick Notes', leadScoreExp);
+mapContact('underwriter notes', prequalNotes);
+mapContact('Estimated ARV', firstValue(offer.estimated_arv, offer.metrics?.arv, offer.property?.arv_value));
+mapContact('Comps Summary Context', compsContext);
+
+mapContact('Gross Rent', investors['Gross Rent']);
+mapContact('Annual Rent', investors['Annual Rent']);
+mapContact('Operating Expenses', investors['Operating Expenses']);
+mapContact('Annual Debt Service - ADS', investors['Annual Debt Service (ADS)']);
+mapContact('DSCR', investors.DSCR);
+mapContact('Annual Cash Flow', investors['Annual Cash-flow']);
+mapContact('Monthly Cash Flow', investors['Monthly Cash-flow']);
+mapContact('Total Cash In / Entry Fee', investors['Total Cash In']);
+mapContact('Cash-on-Cash Return', investors['Cash-on-Cash Return']);
+mapContact('2% Rule Pass/Fail', investors['2% Rule']);
+mapContact('Cash-on-Cash Return - Alternate ID', investors['Cash-on-Cash Return']);
+mapContact('50% Rule PassFail', investors['50% Rule']);
+mapContact('List Price', firstValue(offer.property?.list_price, money(offer.metrics?.list_price, 2)));
+
+mapContact('primary.Offer Type', primaryOfferType);
+mapContact('primary.Purchase Price', getOfferPurchasePrice(primaryOfferNum));
+mapContact('primary.Down Payment $', getOfferDownPaymentDollar(primaryOfferNum));
+mapContact('primary.Down Payment %', percent(getOfferDownPaymentPct(primaryOfferNum)));
+mapContact('primary.Loan Rate %', getOfferLoanRate(primaryOfferNum));
+mapContact('primary.Amortization Years', primaryAmortizationYears, { skipBlankAudit: !primaryNeedsTermFields });
+mapContact('primary.Balloon Term Years', primaryBalloonTermYears, { skipBlankAudit: !primaryNeedsTermFields });
+mapContact('primary.Monthly Payment PI', getOfferMonthlyPaymentPI(primaryOfferNum));
+mapContact('primary.Total Entry Fee', getOfferTotalEntryFee(primaryOfferNum));
+mapContact('primary.Justification', getOfferJustification(primaryOfferNum, primaryOfferNarr));
+
+mapContact('backup.Offer Type', backupOfferType);
+mapContact('backup.Purchase Price', getOfferPurchasePrice(backupOfferNum));
+mapContact('backup.Down Payment $', getOfferDownPaymentDollar(backupOfferNum));
+mapContact('backup.Down Payment %', percent(getOfferDownPaymentPct(backupOfferNum)));
+mapContact('backup.Loan Rate %', getOfferLoanRate(backupOfferNum));
+mapContact('backup.Amortization Years', backupAmortizationYears, { skipBlankAudit: !backupNeedsTermFields });
+mapContact('backup.Balloon Term Years', backupBalloonTermYears, { skipBlankAudit: !backupNeedsTermFields });
+mapContact('backup.Monthly Payment PI', getOfferMonthlyPaymentPI(backupOfferNum));
+mapContact('backup.Total Entry Fee', getOfferTotalEntryFee(backupOfferNum));
+mapContact('backup.Justification', getOfferJustification(backupOfferNum, backupOfferNarr));
+
+mapContact('Final Cash Offer Amount & % of ARV', combinedCashOffer);
+mapContact('Cash Offer Justification', firstValue(cashOfferNarr.Justification, cashOfferNum.Justification));
+mapContact('Subjective Additional Insights', firstValue(investorInsightNarr, transcriptOut.additionalInsights));
+mapContact('Seller Urgency / Condition Summary / Next Steps', urgencySummary);
+mapContact('Lead Score', leadScore);
+mapContact('Direct to Agent LOI text', loiHtml);
+mapContact('Average Rent', rentApi.rent);
+mapContact('Rent Range Low', rentApi.rentRangeLow);
+mapContact('Rent Range High', rentApi.rentRangeHigh);
+mapContact('Average Sale Price Comps', compApi.price);
+mapContact('Sale Price Low', compApi.priceRangeLow);
+mapContact('Sale Price High', compApi.priceRangeHigh);
+mapContact('Zillow Links for Comps', zillowLinks);
+mapContact('Lead Score - Number', leadScore);
+mapContact('Cold/Warm/Hot Evaluation', evaluation);
+mapContact('Evaluation', evaluation);
+mapContact('Next Pipeline Stage', nextPipelineStage);
+mapContact('Buyer Match Summary', buyerMatchSummary ? buyerMatchSummary.replace(/\s*\|\s*/g, '\n') : undefined);
+mapContact('Full Final Json', fullJsonText);
+mapContact('As-Is Value', firstValue(offer.metrics?.as_is_value, offer.property?.est_value, offer.metrics?.estValue));
+mapContact('NOI', investors.NOI);
+
+// --------------------------------------------------
+// DEBUG / QA
+// --------------------------------------------------
+
+const unmappedOpportunityDictionaryKeys = Object.keys(fieldIdsOpp).filter((k) => !usedOppKeys.has(k));
+const unmappedContactDictionaryKeys = Object.keys(fieldIdsContact).filter((k) => !usedContactKeys.has(k));
+
+const nonApplicableTermFieldsPerBucket =
+  (primaryNeedsTermFields ? 0 : 2) +
+  (backupNeedsTermFields ? 0 : 2);
+
+const expectedContactFieldsDynamic = 58 - nonApplicableTermFieldsPerBucket;
+const expectedOpportunityFieldsDynamic = 56 - nonApplicableTermFieldsPerBucket;
+
+const aiNodeLoaded = Object.keys(ai || {}).length > 0;
+const transcriptNodeLoaded = Object.keys(transcriptNode || {}).length > 0;
+
+return [{
+  json: {
+    contactFields,
+    opportunityFields,
+    meta: {
+      expectedContactFields: expectedContactFieldsDynamic,
+      expectedOpportunityFields: expectedOpportunityFieldsDynamic,
+      actualContactFields: contactFields.length,
+      actualOpportunityFields: opportunityFields.length,
+      dictionaryContactKeys: Object.keys(fieldIdsContact).length,
+      dictionaryOpportunityKeys: Object.keys(fieldIdsOpp).length,
+      skippedNoFieldId,
+      skippedNoValue,
+      unmappedContactDictionaryKeys,
+      unmappedOpportunityDictionaryKeys,
+      termFieldApplicability: {
+        primaryOfferType: primaryOfferType || null,
+        primaryNeedsTermFields,
+        backupOfferType: backupOfferType || null,
+        backupNeedsTermFields
+      },
+      sourceAudit: {
+        numbersFrom: safeNode('OFFER ENGINE v1', null) ? 'OFFER ENGINE v1' : null,
+        narrativeFrom: aiNodeLoaded ? 'AI Agent' : 'fallbacks',
+        stageFrom: 'Evaluation & Stage Router',
+        transcriptFrom: firstValue(
+          transcriptNodeLoaded ? 'Pack Agent Input' : null,
+          stageRaw.transcript?.output ? 'Evaluation & Stage Router.transcript.output' : null,
+          offer.transcript?.output ? 'Offer Engine transcript.output' : null,
+          'none'
+        )
+      }
+    }
+  }
+}];
