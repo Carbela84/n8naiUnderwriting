@@ -1,0 +1,1039 @@
+
+
+
+// ==========================================
+// COMPUTE METRICS v11.1
+// Uses Selected Comps as source of truth for ARV + comp report
+// ==========================================
+
+function parseMoney(x) {
+  if (x === undefined || x === null || x === '') return 0;
+  if (typeof x === 'number') return Number.isFinite(x) ? x : 0;
+  const s = String(x).replace(/[^\d.\-]/g, '');
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function firstNonEmpty(...vals) {
+  for (const v of vals) {
+    if (v === 0) return 0;
+    if (v === false) return false;
+    if (v === null || v === undefined) continue;
+    if (typeof v === 'string' && v.trim() !== '') return v;
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'boolean') return v;
+  }
+  return null;
+}
+
+function firstPositive(...vals) {
+  for (const v of vals) {
+    const n = parseMoney(v);
+    if (n > 0) return n;
+  }
+  return 0;
+}
+
+function txt(v) {
+  return String(v ?? '').trim();
+}
+
+function round(n, digits = 0) {
+  const p = Math.pow(10, digits);
+  return Math.round((Number(n) || 0) * p) / p;
+}
+
+function median(nums) {
+  const arr = nums.filter(n => Number.isFinite(n)).sort((a, b) => a - b);
+  if (!arr.length) return 0;
+  const mid = Math.floor(arr.length / 2);
+  return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+}
+
+function avg(nums) {
+  const arr = nums.filter(n => Number.isFinite(n));
+  if (!arr.length) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function safeNode(name, fallback = {}) {
+  try {
+    const v = $(name).first().json;
+    return v ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function moneyStr(n) {
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return `$${Math.round(n).toLocaleString(undefined, { maximumFractionDigits: 0 })}.00`;
+}
+
+function clamp(n, min, max) {
+  return Math.min(max, Math.max(min, n));
+}
+
+function amortizedPI(balance, annualRatePct, years = 30) {
+  const P = parseMoney(balance);
+  const rate = parseMoney(annualRatePct);
+  if (P <= 0 || rate <= 0) return 0;
+  const r = (rate / 100) / 12;
+  const n = years * 12;
+  return P * ((r * Math.pow(1 + r, n)) / (Math.pow(1 + r, n) - 1));
+}
+
+function isReasonableAsIs(candidate, anchors = {}) {
+  const v = parseMoney(candidate);
+  if (v <= 0) return false;
+
+  const list = parseMoney(anchors.listPrice);
+  const compLow = parseMoney(anchors.compLow);
+  const market = parseMoney(anchors.marketValue);
+
+  if (list > 0 && v < list * 0.60) return false;
+  if (compLow > 0 && v < compLow * 0.55) return false;
+  if (market > 0 && v < market * 0.55) return false;
+
+  return true;
+}
+
+function chooseAsIsValue(candidates, anchors, warnings) {
+  for (const c of candidates) {
+    const value = parseMoney(c.value);
+    if (!value) continue;
+
+    if (!c.requiresSanity || isReasonableAsIs(value, anchors)) {
+      return {
+        value,
+        source: c.source,
+        confidence: c.confidence
+      };
+    }
+
+    warnings.push(`Rejected ${c.source} for as-is value because it failed sanity checks: $${Math.round(value).toLocaleString()}.`);
+  }
+
+  if (parseMoney(anchors.listPrice) > 0) {
+    const fallback = Math.round(parseMoney(anchors.listPrice) * 0.90);
+    warnings.push('As-is value fell back to 90% of list price because stronger sources were missing or failed sanity checks.');
+    return {
+      value: fallback,
+      source: 'fallback_list_price_90pct',
+      confidence: 'low'
+    };
+  }
+
+  if (parseMoney(anchors.compLow) > 0) {
+    warnings.push('As-is value fell back to comp_low because stronger sources were missing.');
+    return {
+      value: parseMoney(anchors.compLow),
+      source: 'fallback_comp_low',
+      confidence: 'low'
+    };
+  }
+
+  return {
+    value: 0,
+    source: 'missing',
+    confidence: 'none'
+  };
+}
+
+function buildCompReport(comparables) {
+  if (!Array.isArray(comparables)) return [];
+
+  return comparables.slice(0, 10).map(c => ({
+    address: c.formattedAddress || c.address || null,
+    correlation: c.correlation != null
+      ? round(parseMoney(c.correlation) * (parseMoney(c.correlation) <= 1 ? 100 : 1), 1)
+      : null,
+    price: parseMoney(c.price) || null,
+    beds: parseMoney(c.bedrooms ?? c.beds) || null,
+    baths: parseMoney(c.bathrooms ?? c.baths) || null,
+    squareFootage: parseMoney(c.squareFootage) || null,
+    pricePerSqFt: parseMoney(c.pricePerSqFt) || (
+      parseMoney(c.price) > 0 && parseMoney(c.squareFootage) > 0
+        ? round(parseMoney(c.price) / parseMoney(c.squareFootage), 2)
+        : null
+    ),
+    yearBuilt: parseMoney(c.yrBuilt ?? c.yearBuilt) || null,
+    dateSold: c.dateSold || c.soldDate || c.removedDate || c.closedDate || null,
+    daysOnMarket: c.daysOnMarket ?? null,
+    daysOld: c.daysOld ?? null,
+    distance: parseMoney(c.distance) || null
+  }));
+}
+
+function weightedMedian(values, weights) {
+  const pairs = values
+    .map((v, i) => ({ v, w: weights[i] }))
+    .filter(x => Number.isFinite(x.v) && Number.isFinite(x.w) && x.w > 0)
+    .sort((a, b) => a.v - b.v);
+
+  if (!pairs.length) return 0;
+
+  const totalWeight = pairs.reduce((sum, x) => sum + x.w, 0);
+  let running = 0;
+
+  for (const p of pairs) {
+    running += p.w;
+    if (running >= totalWeight / 2) return p.v;
+  }
+
+  return pairs[pairs.length - 1].v;
+}
+
+function sameText(a, b) {
+  return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+}
+
+function extractPropertyTaxesFromNode(node) {
+  if (!node || typeof node !== 'object') return 0;
+
+  const direct = firstPositive(
+    node.annualTaxes,
+    node.annualTax,
+    node.taxAmount,
+    node.propertyTax,
+    node.propertyTaxesAnnual,
+    node.tax
+  );
+  if (direct > 0) return direct;
+
+  if (node.propertyTaxes && typeof node.propertyTaxes === 'object') {
+    return firstPositive(
+      node.propertyTaxes?.['2026']?.total,
+      node.propertyTaxes?.['2025']?.total,
+      node.propertyTaxes?.['2024']?.total,
+      node.propertyTaxes?.['2023']?.total,
+      node.propertyTaxes?.['2022']?.total
+    );
+  }
+
+  return 0;
+}
+
+function estimateRepairCost({ explicitRepair, sqft, yearBuilt, transcriptText, mlsDesc, warnings }) {
+  const explicit = parseMoney(explicitRepair);
+  if (explicit > 0) {
+    return {
+      estimatedRepairCost: explicit,
+      repair_estimate_source: 'explicit_input',
+      repair_cost_per_sqft: sqft > 0 ? round(explicit / sqft, 2) : null
+    };
+  }
+
+  const text = `${txt(transcriptText)} ${txt(mlsDesc)}`.toLowerCase();
+
+  const heavyRehabLike = /\b(full gut|gut rehab|foundation|fire damage|structural|needs everything|major rehab|flood damage)\b/.test(text);
+  const moderateRehabLike = /\b(needs work|deferred maintenance|dated|cosmetic rehab|updating needed|fixer|handyman)\b/.test(text);
+  const recentlyUpdatedLike = /\b(new roof|new hvac|new ac|new plumbing|renovated|updated|move-in ready|turnkey|brand new|new construction|built in 20\d{2})\b/.test(text);
+
+  const currentYear = new Date().getFullYear();
+  const age = yearBuilt ? Math.max(0, currentYear - yearBuilt) : null;
+
+  let perSqft = 20;
+  let minRepair = 30000;
+  let source = 'age_based_default';
+
+  if (heavyRehabLike) {
+    perSqft = 30;
+    minRepair = 45000;
+    source = 'heavy_rehab_signal';
+  } else if (moderateRehabLike) {
+    perSqft = 15;
+    minRepair = 18000;
+    source = 'moderate_rehab_signal';
+  } else if (recentlyUpdatedLike) {
+    perSqft = 5;
+    minRepair = 6000;
+    source = 'recently_updated_signal';
+  } else if (age !== null) {
+    if (age <= 3) {
+      perSqft = 4;
+      minRepair = 5000;
+      source = 'very_new_property_age_curve';
+    } else if (age <= 10) {
+      perSqft = 6;
+      minRepair = 7500;
+      source = 'newer_property_age_curve';
+    } else if (age <= 25) {
+      perSqft = 10;
+      minRepair = 12000;
+      source = 'mid_age_property_age_curve';
+    } else if (age <= 45) {
+      perSqft = 15;
+      minRepair = 18000;
+      source = 'older_property_age_curve';
+    } else {
+      perSqft = 22;
+      minRepair = 25000;
+      source = 'old_property_age_curve';
+    }
+  }
+
+  const estimate = sqft > 0 ? Math.max(minRepair, Math.round(sqft * perSqft)) : minRepair;
+
+  return {
+    estimatedRepairCost: estimate,
+    repair_estimate_source: source,
+    repair_cost_per_sqft: sqft > 0 ? perSqft : null
+  };
+}
+
+function compDistanceLimit(ctx) {
+  if (ctx.comp_tier_mode === 'tier_1_hyperlocal') return ctx.distance_policy?.tier_1_max_miles || 0.5;
+  if (ctx.comp_tier_mode === 'tier_2_subdivision_sensitive') return ctx.distance_policy?.tier_2_max_miles || 1.0;
+  return ctx.distance_policy?.tier_3_max_miles || 2.0;
+}
+
+const items = $input.all();
+const results = [];
+
+const res = (() => {
+  try {
+    const r = $('Normalize Subject + Mode').first().json;
+    if (r && r.resolved) return r.resolved;
+  } catch {}
+  try {
+    const r = $('Deduplicate Opportunities').first().json;
+    if (r && r.resolved) return r.resolved;
+  } catch {}
+  return items[0]?.json?.resolved || {};
+})();
+
+const webhook = safeNode('Start Webhook1');
+const cd = (webhook.body && Object.keys(webhook.body).length > 0)
+  ? (webhook.body.customData || {})
+  : {};
+
+const rentalNode = safeNode('Fetch rental comps');
+const saleNode = safeNode('Fetch Sale Data');
+const compsNode = safeNode('Fetch Comps API');
+const selectedCompsNode = safeNode('Selected Comps');
+const propNode = safeNode('HTTP Request6');
+
+for (const item of items) {
+  const it = item.json || {};
+  const warnings = [];
+
+  const rentalModels = it.rental_models || {};
+  const canonicalKey = it.canonical_rental_model || 'standard';
+  const rental = rentalModels[canonicalKey];
+
+  if (!rental || rental.grossRentMonthly == null) {
+    throw new Error('Compute Metrics: Missing canonical rental model or rent');
+  }
+
+  const canonicalGrossRent = Number(rental.grossRentMonthly);
+  const canonicalAnnualRent = canonicalGrossRent * 12;
+
+  const address = String(res.raw_address || '').trim();
+  const city = String(res.raw_city || '').trim();
+  const state = String(res.raw_state || '').trim().toUpperCase();
+  const postal = String(res.raw_zip || '').trim();
+
+  const beds = Number(firstNonEmpty(res.building_beds, res.unit_beds, res.source_assumptions?.beds_input, it.property?.beds, 0));
+  const baths = Number(firstNonEmpty(res.building_baths, res.unit_baths, res.source_assumptions?.baths_input, it.property?.baths, 0));
+  const sqft = Number(firstNonEmpty(res.building_sqft, res.unit_sqft, res.source_assumptions?.sqft_input, it.metrics?.sqft, 0));
+
+  const rentBeds = Number(firstNonEmpty(res.unit_beds, res.building_beds, res.source_assumptions?.beds_input, beds, 0));
+  const rentBaths = Number(firstNonEmpty(res.unit_baths, res.building_baths, res.source_assumptions?.baths_input, baths, 0));
+  const rentSqft = Number(firstNonEmpty(res.unit_sqft, res.building_sqft, res.source_assumptions?.sqft_input, sqft, 0));
+
+  let yearBuilt = firstNonEmpty(
+    propNode.yearBuilt,
+    saleNode.yearBuilt,
+    compsNode.subjectProperty?.yearBuilt,
+    rentalNode.subjectProperty?.yearBuilt,
+    cd.year_built_mls,
+    cd.yearBuilt,
+    res.yearBuilt,
+    res.source_assumptions?.year_built,
+    it.property?.year_built_mls,
+    null
+  );
+
+  if (typeof yearBuilt === 'string') yearBuilt = parseInt(yearBuilt.replace(/[^\d]/g, ''), 10);
+  yearBuilt = Number.isFinite(yearBuilt) && yearBuilt >= 1700 && yearBuilt <= 2100 ? yearBuilt : null;
+
+  const propType = String(
+    res.property_type_for_value ||
+    compsNode.subjectProperty?.propertyType ||
+    rentalNode.subjectProperty?.propertyType ||
+    saleNode.propertyType ||
+    cd.prop_type ||
+    it.metrics?.propertyType ||
+    'single family'
+  ).toLowerCase();
+
+  const oppArv = parseMoney(firstNonEmpty(res.est_arv, res.source_assumptions?.est_arv, cd['opp.estArv'], cd.estArv, null));
+  const normalizedEstValue = parseMoney(firstNonEmpty(res.source_assumptions?.est_value, cd['opp.estValue'], cd.estValue, null));
+
+  const mlsDesc = String(firstNonEmpty(cd.mlsDescription, saleNode.description, it.property?.mls_description, '') || '').trim();
+  const transcriptText = String(firstNonEmpty(cd.prequalified_phone_transcript, cd.contact_pq_transcript, ''));
+
+  const dom = Number(firstNonEmpty(saleNode.daysOnMarket, saleNode.dom, res.source_assumptions?.days_on_market, cd.dom, it.property?.dom, null)) || 0;
+
+  const currentFullBaths = Number(firstNonEmpty(it.metrics?.currentFullBaths, it.realtor_room_details?.fullBathrooms, it.realtor?.fullBathrooms, it.property?.full_bathrooms, 0));
+  const currentHalfBaths = Number(firstNonEmpty(it.metrics?.currentHalfBaths, it.realtor_room_details?.halfBathrooms, it.realtor?.halfBathrooms, it.property?.half_bathrooms, 0));
+  const totalBathrooms = Number(firstNonEmpty(it.metrics?.totalBathrooms, it.realtor_room_details?.totalBathrooms, it.realtor?.totalBathrooms, currentFullBaths + currentHalfBaths, baths, 0));
+
+  const officePresent = !!firstNonEmpty(it.realtor_room_details?.office, it.realtor?.office, false);
+  const gameRoomPresent = !!firstNonEmpty(it.realtor_room_details?.gameRoom, it.realtor?.gameRoom, false);
+
+  const rawListPrice = parseMoney(firstNonEmpty(
+    saleNode.price,
+    res.source_assumptions?.list_price,
+    cd['opp.listPrice'],
+    cd.list_price,
+    cd.ListPrice,
+    it.property?.list_price,
+    0
+  ));
+
+  const listPrice = rawListPrice > 0 ? rawListPrice : 0;
+
+  const listPriceSource =
+    saleNode.price ? 'sale_listing_price' :
+    res.source_assumptions?.list_price ? 'normalized_source_assumptions' :
+    cd['opp.listPrice'] || cd.list_price || cd.ListPrice ? 'legacy_custom_data' :
+    it.property?.list_price ? 'property_payload' :
+    'missing';
+
+  let taxAssessedValue = parseMoney(res.source_assumptions?.assessed_total_value);
+
+  if (!taxAssessedValue) {
+    try {
+      const propData = propNode.taxAssessments ? propNode : (compsNode.subjectProperty || {});
+      if (propData && propData.taxAssessments) {
+        taxAssessedValue =
+          parseMoney(propData.taxAssessments?.['2026']?.value) ||
+          parseMoney(propData.taxAssessments?.['2025']?.value) ||
+          parseMoney(propData.taxAssessments?.['2024']?.value) ||
+          parseMoney(propData.taxAssessments?.['2023']?.value) ||
+          0;
+      }
+    } catch {}
+  }
+
+  const selectedComps = Array.isArray(selectedCompsNode.selected_comps)
+    ? selectedCompsNode.selected_comps
+    : [];
+
+  const selectedCompsArv = parseMoney(selectedCompsNode.estARV);
+  const selectedCompsAvgPpsf = parseMoney(selectedCompsNode.analysis?.averagePpsqft);
+  const selectedCompsValidCount = parseMoney(selectedCompsNode.analysis?.validSoldCompsFound || selectedComps.length);
+
+  const selectedPrices = selectedComps
+    .map(c => parseMoney(c.price))
+    .filter(v => v > 0);
+
+  const selectedCompLow = selectedPrices.length ? Math.min(...selectedPrices) : 0;
+  const selectedCompHigh = selectedPrices.length ? Math.max(...selectedPrices) : 0;
+
+  const compLow = firstPositive(selectedCompsNode.priceRangeLow, selectedCompLow, compsNode.priceRangeLow);
+  const compHigh = firstPositive(selectedCompsNode.priceRangeHigh, selectedCompHigh, compsNode.priceRangeHigh);
+  const compMid = parseMoney(compsNode.price);
+
+  const fallbackSaleComparables = Array.isArray(compsNode.comparables) ? compsNode.comparables : [];
+  const saleComparables = selectedComps.length ? selectedComps : fallbackSaleComparables;
+
+  let ppsfArv = 0;
+  let ppsfArvSource = 'missing';
+
+  if (selectedCompsArv > 0) {
+    ppsfArv = Math.round(selectedCompsArv);
+    ppsfArvSource = 'selected_comps_filtered_sold_avg_ppsf';
+    warnings.push(`ARV was sourced from Selected Comps node using ${selectedCompsValidCount || selectedComps.length} filtered sold comps.`);
+  } else if (selectedCompsAvgPpsf > 0 && sqft > 0) {
+    ppsfArv = Math.round(selectedCompsAvgPpsf * sqft);
+    ppsfArvSource = 'selected_comps_avg_ppsf_recalculated';
+    warnings.push('Selected Comps did not provide estARV, so ARV was recalculated from Selected Comps average PPSF × subject sqft.');
+  } else if (!selectedComps.length && fallbackSaleComparables.length) {
+    const locationCtx = (() => {
+      try {
+        return $('Location Context v1').first().json.location_context || {};
+      } catch {
+        return {};
+      }
+    })();
+
+    const maxDist = compDistanceLimit(locationCtx);
+
+    const validSaleComps = fallbackSaleComparables.filter(c => {
+      const price = parseMoney(c.price);
+      const compSqft = parseMoney(c.squareFootage);
+      const compBeds = parseMoney(c.bedrooms);
+      const compBaths = parseMoney(c.bathrooms);
+      const dist = parseMoney(c.distance);
+
+      if (price <= 0 || compSqft <= 0) return false;
+      if (dist > maxDist) return false;
+      if (beds > 0 && compBeds > 0 && Math.abs(compBeds - beds) > 1) return false;
+      if (baths > 0 && compBaths > 0 && Math.abs(compBaths - baths) > 1) return false;
+
+      if (sqft > 0) {
+        const ratio = compSqft / sqft;
+        if (ratio < 0.75 || ratio > 1.25) return false;
+      }
+
+      return true;
+    });
+
+    const scored = validSaleComps
+      .map(c => ({
+        comp: c,
+        score: 100 - (parseMoney(c.distance) * 25),
+        ppsf: parseMoney(c.price) / parseMoney(c.squareFootage)
+      }))
+      .filter(x => Number.isFinite(x.ppsf) && x.ppsf > 0 && Number.isFinite(x.score))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
+
+    if (scored.length) {
+      const values = scored.map(x => x.ppsf);
+      const weights = scored.map(x => Math.max(1, x.score));
+      const chosenPpsf = weightedMedian(values, weights);
+
+      ppsfArv = Math.round(chosenPpsf * (sqft > 0 ? sqft : parseMoney(compsNode.subjectProperty?.squareFootage) || 1500));
+      ppsfArvSource = 'fallback_comps_api_weighted_median_ppsf';
+      warnings.push('Selected Comps was empty, so ARV fell back to internal filtered Comps API logic.');
+    }
+  }
+
+  const saleAvmEstimate = parseMoney(firstNonEmpty(saleNode.estValue, saleNode.est_value, 0));
+  const marketValueEstimate = parseMoney(firstNonEmpty(it.market_data_extracted?.estimatedMarketValue, it.market_data_trends?.estimatedMarketValue, 0));
+
+  const asIsCandidates = [
+    { source: 'sale_avm_estimate', value: saleAvmEstimate, confidence: 'medium', requiresSanity: true },
+    { source: 'normalized_est_value', value: normalizedEstValue, confidence: 'medium', requiresSanity: true },
+    { source: 'selected_comp_low', value: compLow, confidence: 'medium', requiresSanity: true },
+    { source: 'market_value_estimate', value: marketValueEstimate, confidence: 'low', requiresSanity: true },
+    { source: 'list_price', value: listPrice, confidence: 'low', requiresSanity: false },
+    { source: 'tax_assessed_value', value: taxAssessedValue, confidence: 'low', requiresSanity: false }
+  ];
+
+  const asIsPick = chooseAsIsValue(asIsCandidates, {
+    listPrice,
+    compLow,
+    marketValue: marketValueEstimate
+  }, warnings);
+
+  const as_is_value = asIsPick.value;
+  const as_is_value_source = asIsPick.source;
+  const as_is_value_confidence = asIsPick.confidence;
+
+  let arv = 0;
+  let arv_source = 'missing';
+
+  if (ppsfArv > 0) {
+    arv = ppsfArv;
+    arv_source = ppsfArvSource;
+  } else if (compMid > 0) {
+    arv = compMid;
+    arv_source = 'comps_api_price_fallback';
+    warnings.push('Selected Comps did not return usable ARV. Fell back to Comps API price.');
+  } else if (compHigh > 0) {
+    arv = compHigh;
+    arv_source = 'comp_high_fallback';
+  } else if (oppArv > 0) {
+    arv = oppArv;
+    arv_source = 'normalized_est_arv_last_resort';
+    warnings.push('ARV fell back to BatchLeads / normalized estimated ARV because Selected Comps and comp API ARV were missing.');
+  } else if (marketValueEstimate > 0) {
+    arv = Math.round(marketValueEstimate * 1.10);
+    arv_source = 'market_value_plus_10pct';
+    warnings.push('ARV missing from comp sources. Derived from market value estimate + 10%.');
+  } else if (listPrice > 0) {
+    arv = Math.round(listPrice * 1.10);
+    arv_source = 'list_price_plus_10pct';
+    warnings.push('ARV missing from comp sources. Derived from list price + 10%.');
+  } else if (as_is_value > 0) {
+    arv = Math.round(as_is_value * 1.15);
+    arv_source = 'as_is_plus_15pct';
+    warnings.push('ARV missing from comp sources. Derived from as-is value + 15%.');
+  }
+
+  if (taxAssessedValue > 0 && arv > 0 && arv < taxAssessedValue) {
+    warnings.push(`ARV ($${Math.round(arv).toLocaleString()}) came in below county assessed value ($${Math.round(taxAssessedValue).toLocaleString()}). Kept ARV unchanged; assessed value is reference-only.`);
+  }
+
+  if (arv > 0 && as_is_value > 0 && as_is_value > arv) {
+    warnings.push(`As-is value ($${Math.round(as_is_value).toLocaleString()}) is above ARV ($${Math.round(arv).toLocaleString()}). Check value inputs and condition assumptions.`);
+  }
+
+  const repairResult = estimateRepairCost({
+    explicitRepair: firstNonEmpty(cd.repair_costs, cd.repairs, cd.EstimatedRepairs, cd['PQ | Estimated Repairs $'], null),
+    sqft,
+    yearBuilt,
+    transcriptText,
+    mlsDesc,
+    warnings
+  });
+
+  const estimatedRepairCost = repairResult.estimatedRepairCost;
+  const repair_estimate_source = repairResult.repair_estimate_source;
+  const repair_cost_per_sqft = repairResult.repair_cost_per_sqft;
+
+  let marketRent = parseMoney(firstNonEmpty(res.extracted_rent_roll, res.extractedRentRoll, canonicalGrossRent));
+
+  if (!res.extracted_rent_roll && Array.isArray(rentalNode.comparables) && rentalNode.comparables.length > 0) {
+    let validRents = rentalNode.comparables.filter(c => parseMoney(c.price) > 0);
+
+    validRents = validRents.filter(c => {
+      const dist = parseMoney(c.distance);
+      const compBeds = parseMoney(c.bedrooms);
+      const compBaths = parseMoney(c.bathrooms);
+      const compSqft = parseMoney(c.squareFootage);
+
+      if (dist > 2) return false;
+      if (rentBeds > 0 && compBeds > 0 && Math.abs(compBeds - rentBeds) > 1) return false;
+      if (rentBaths > 0 && compBaths > 0 && Math.abs(compBaths - rentBaths) > 1) return false;
+
+      if (rentSqft > 0 && compSqft > 0) {
+        const ratio = compSqft / rentSqft;
+        if (ratio < 0.75 || ratio > 1.25) return false;
+      }
+
+      return true;
+    });
+
+    if (validRents.length > 0) marketRent = Math.round(avg(validRents.map(c => parseMoney(c.price))));
+  }
+
+  if (canonicalGrossRent > 0) marketRent = canonicalGrossRent;
+
+  const annualRent = marketRent * 12;
+  const proFormaRent = arv > 0 ? Math.round(arv * 0.01) : 0;
+
+  const HIGH_RISK_INS_STATES = new Set(['FL', 'TX', 'LA', 'OK', 'AL', 'MS', 'SC', 'NC', 'GA', 'CA']);
+  const insuranceRate = HIGH_RISK_INS_STATES.has(state) ? 0.012 : 0.006;
+  const defaultTaxRate = 0.0115;
+
+  const propertyTaxActual = firstPositive(
+    res.annual_taxes,
+    res.source_assumptions?.annual_taxes,
+    cd['annual taxes'],
+    cd['anual taxes'],
+    cd['Annual Property Taxes'],
+    cd['PQ | Annual Property Taxes'],
+    it.metrics?.taxes,
+    extractPropertyTaxesFromNode(propNode),
+    extractPropertyTaxesFromNode(saleNode),
+    extractPropertyTaxesFromNode(compsNode.subjectProperty || {})
+  );
+
+  let taxes = firstPositive(
+    res.annual_taxes,
+    res.source_assumptions?.annual_taxes,
+    cd['annual taxes'],
+    cd['anual taxes'],
+    cd['Annual Property Taxes'],
+    cd['PQ | Annual Property Taxes'],
+    it.metrics?.taxes,
+    propertyTaxActual
+  );
+
+  if (!taxes) {
+    taxes = firstPositive(
+      listPrice > 0 ? Math.round(listPrice * defaultTaxRate) : 0,
+      as_is_value > 0 ? Math.round(as_is_value * defaultTaxRate) : 0,
+      arv > 0 ? Math.round(arv * defaultTaxRate) : 0
+    );
+    warnings.push('Taxes fell back to percentage-based estimate because no actual annual tax figure was found upstream.');
+  }
+
+  let insurance = parseMoney(firstNonEmpty(cd.insuranceAnnual, cd.insuranceMonthly ? Math.round(parseMoney(cd.insuranceMonthly) * 12) : 0, it.metrics?.insurance, 0));
+
+  if (!insurance) {
+    if (taxes > 0) insurance = Math.round(taxes * (HIGH_RISK_INS_STATES.has(state) ? 0.56 : 0.80));
+    else insurance = Math.round((listPrice || as_is_value || arv || 100000) * insuranceRate);
+  }
+
+  const isSmallMulti = /(duplex|triplex|fourplex|quad|multi)/.test(propType);
+  const isRVPark = /\b(rv park|mobile home park|campground|mhp|rv resort)\b/.test(propType) ||
+                   /\b(rv park|mobile home park|campground)\b/i.test(mlsDesc);
+
+  let mgmtRate = rental.assumptions?.mgmtRate ?? (isSmallMulti ? 0.09 : (isRVPark ? 0.12 : 0.08));
+  let maintRate = rental.assumptions?.maintRate ?? (isSmallMulti ? 0.07 : (isRVPark ? 0.15 : 0.05));
+  let vacancyRate = rental.assumptions?.vacancyRate ?? (isSmallMulti ? 0.07 : (isRVPark ? 0.10 : 0.05));
+
+  if (yearBuilt && yearBuilt < 1980 && !isRVPark) maintRate += 0.02;
+
+  const utilitiesRate = rental.assumptions?.utilitiesIncluded ? 0.10 : (isRVPark ? 0.10 : 0);
+
+  const mgmt = Math.round(mgmtRate * annualRent);
+  const maint = Math.round(maintRate * annualRent);
+  const vacancy = Math.round(vacancyRate * annualRent);
+  const utilities = Math.round(utilitiesRate * annualRent);
+
+  const opex = mgmt + maint + vacancy + utilities + taxes + insurance;
+  const noi = annualRent - opex;
+  const tiMonthly = (taxes + insurance) / 12;
+  const monthlyOpex = round(opex / 12, 2);
+
+  const loanData = res.loan_data || {};
+
+  const loanBalance = parseMoney(firstNonEmpty(
+    loanData.loan_1_balance,
+    loanData.total_open_loans_amount,
+    cd['Loan 1 Balance'],
+    cd['opp.totalAmountOfOpenLoans'],
+    it.existing_loan?.balance,
+    0
+  ));
+
+  const loanRate = parseMoney(firstNonEmpty(loanData.loan_1_rate, cd['Loan 1 rate'], cd['Loan 1 Rate'], it.existing_loan?.rate, 0));
+
+  let sellerMonthlyPaymentPI = parseMoney(firstNonEmpty(
+    loanData.loan_1_monthly_payment,
+    cd['Loan 1 Monthly payment'],
+    it.existing_loan?.sellerMonthlyPaymentPI,
+    0
+  ));
+
+  const originalPrincipal = parseMoney(firstNonEmpty(
+    loanData.loan_1_original_principal,
+    cd['loan 1 original principal'],
+    cd['Loan 1 Original Principal'],
+    it.existing_loan?.original_principal,
+    0
+  ));
+
+  if (loanBalance > 0 && sellerMonthlyPaymentPI === 0 && loanRate > 0) {
+    sellerMonthlyPaymentPI = amortizedPI(loanBalance, loanRate, 30);
+  }
+
+  let rawLtv = parseMoney(firstNonEmpty(cd.l_to_v_ratio, null));
+  let ltv = null;
+
+  if (rawLtv) ltv = rawLtv > 1 ? rawLtv / 100 : rawLtv;
+  if (ltv !== null) ltv = clamp(ltv, 0, 1.25);
+
+  let equity_pct = null;
+
+  if (ltv !== null) equity_pct = (1 - ltv) * 100;
+  else if (as_is_value > 0 && loanBalance > 0) equity_pct = ((as_is_value - loanBalance) / as_is_value) * 100;
+  else if (loanBalance <= 0) equity_pct = 100;
+
+  if (equity_pct !== null) equity_pct = clamp(equity_pct, -100, 100);
+
+  const variableExpenseRate = clamp(mgmtRate + maintRate + vacancyRate + utilitiesRate, 0, 0.95);
+  const fixedMonthlyCosts = round(((taxes + insurance) / 12) + sellerMonthlyPaymentPI, 2);
+
+  const breakEvenRentMonthly = variableExpenseRate < 1
+    ? round(fixedMonthlyCosts / (1 - variableExpenseRate), 2)
+    : null;
+
+  const breakEvenGapMonthly = breakEvenRentMonthly != null
+    ? round(marketRent - breakEvenRentMonthly, 2)
+    : null;
+
+  const debtServiceAnnualPIOnly = round(sellerMonthlyPaymentPI * 12, 2);
+  const fixedOpexAnnual = round(taxes + insurance, 2);
+
+  const rentNeededForDSCR120Existing = debtServiceAnnualPIOnly > 0 && variableExpenseRate < 1
+    ? round((((debtServiceAnnualPIOnly * 1.20) + fixedOpexAnnual) / 12) / (1 - variableExpenseRate), 2)
+    : null;
+
+  const baseDSCRPIOnly = debtServiceAnnualPIOnly > 0
+    ? round(noi / debtServiceAnnualPIOnly, 3)
+    : null;
+
+  const padsplitNode = it.rental_models?.padsplit || {};
+  const padsplitDebug = padsplitNode.debug || {};
+  const padsplitAllowed = !!padsplitNode.allowed;
+  const padsplitFeasible = !!padsplitNode.feasible;
+
+  const padsplitCurrentRooms = Number(firstNonEmpty(padsplitDebug.currentRooms, it.padsplit_current_vs_target?.currentRooms, beds, 0));
+  const padsplitTargetRooms = Number(firstNonEmpty(padsplitDebug.targetRooms, it.padsplit_current_vs_target?.targetRooms, padsplitCurrentRooms, 0));
+  const padsplitCurrentBaths = Number(firstNonEmpty(padsplitDebug.currentBaths, currentFullBaths, baths, 0));
+  const padsplitRequiredBaths = Number(firstNonEmpty(padsplitDebug.requiredBaths, padsplitCurrentBaths, 0));
+  const padsplitBathroomsToAdd = Number(firstNonEmpty(padsplitDebug.bathsToAdd, 0));
+  const padsplitRoomsToAdd = Number(firstNonEmpty(padsplitDebug.roomsToAdd, 0));
+
+  const padsplitGrossRentMonthly = parseMoney(firstNonEmpty(padsplitNode.grossRentMonthly, padsplitDebug.padsplitRentCandidate, 0));
+  const padsplitUpliftMonthly = parseMoney(firstNonEmpty(padsplitDebug.upliftMonthly, padsplitGrossRentMonthly > 0 ? padsplitGrossRentMonthly - marketRent : 0, 0));
+  const padsplitRenoEstimate = parseMoney(firstNonEmpty(padsplitDebug.totalRenoEstimate, padsplitDebug.renoEstimate, 0));
+  const padsplitSupportedReno = parseMoney(firstNonEmpty(padsplitDebug.supportedReno, 0));
+  const padsplitBathroomRisk = firstNonEmpty(padsplitDebug.bathroomInfrastructureRisk, null);
+
+  let explicitStandardRoomCount = Number(firstNonEmpty(it.padsplit_room_mix?.standardRoomCount, 0));
+  let explicitEnsuiteRoomCount = Number(firstNonEmpty(it.padsplit_room_mix?.ensuiteRoomCount, 0));
+
+  let inferredEnsuiteRooms = 0;
+  if (padsplitTargetRooms > 0) {
+    if (currentFullBaths >= 2 && padsplitTargetRooms >= 4) inferredEnsuiteRooms = 1;
+    if (currentFullBaths >= 3 && padsplitTargetRooms >= 5) inferredEnsuiteRooms = Math.max(inferredEnsuiteRooms, 2);
+  }
+
+  let standardRoomCount = explicitStandardRoomCount;
+  let ensuiteRoomCount = explicitEnsuiteRoomCount;
+
+  if (standardRoomCount === 0 && ensuiteRoomCount === 0 && padsplitTargetRooms > 0) {
+    ensuiteRoomCount = Math.min(inferredEnsuiteRooms, padsplitTargetRooms);
+    standardRoomCount = Math.max(padsplitTargetRooms - ensuiteRoomCount, 0);
+  }
+
+  const standardRoomRate = parseMoney(firstNonEmpty(it.padsplit_room_mix?.standardRoomRate, padsplitDebug.standardRoomRate, 850));
+  const ensuiteRoomRate = parseMoney(firstNonEmpty(it.padsplit_room_mix?.ensuiteRoomRate, padsplitDebug.ensuiteRoomRate, 1150));
+
+  const inferredRoomMixGross = (standardRoomCount * standardRoomRate) + (ensuiteRoomCount * ensuiteRoomRate);
+
+  const finalPadsplitGrossRentMonthly =
+    padsplitGrossRentMonthly > 0
+      ? padsplitGrossRentMonthly
+      : inferredRoomMixGross;
+
+  const padsplitVacancyRate = Number(firstNonEmpty(padsplitNode.assumptions?.vacancyRate, 0.12));
+  const padsplitMgmtRate = Number(firstNonEmpty(padsplitNode.assumptions?.mgmtRate, 0.18));
+  const padsplitMaintRate = Number(firstNonEmpty(padsplitNode.assumptions?.maintRate, 0.09));
+  const padsplitUtilitiesIncluded = !!firstNonEmpty(padsplitNode.assumptions?.utilitiesIncluded, true);
+
+  const padsplitMonthlyUtilities = parseMoney(firstNonEmpty(it.padsplit_expenses?.monthlyUtilities, padsplitUtilitiesIncluded ? 450 : 0, 0));
+  const padsplitMonthlyCleaning = parseMoney(firstNonEmpty(it.padsplit_expenses?.monthlyCleaning, 100, 0));
+  const padsplitMonthlyTurnReserve = parseMoney(firstNonEmpty(it.padsplit_expenses?.monthlyTurnReserve, 75, 0));
+
+  const padsplit_room_mix = {
+    standardRoomCount,
+    ensuiteRoomCount,
+    standardRoomRate,
+    ensuiteRoomRate,
+    source: explicitStandardRoomCount > 0 || explicitEnsuiteRoomCount > 0 ? 'explicit_input' : 'inferred_from_layout'
+  };
+
+  const padsplit_expenses = {
+    monthlyUtilities: padsplitMonthlyUtilities,
+    monthlyCleaning: padsplitMonthlyCleaning,
+    monthlyTurnReserve: padsplitMonthlyTurnReserve
+  };
+
+  const comp_properties_report = buildCompReport(saleComparables);
+
+  let comps_summary = '';
+  if (comp_properties_report.length) {
+    const prices = comp_properties_report.map(c => parseMoney(c.price)).filter(Boolean);
+    const low = prices.length ? Math.min(...prices) : 0;
+    const high = prices.length ? Math.max(...prices) : 0;
+
+    comps_summary =
+      `Top ${Math.min(comp_properties_report.length, 10)} selected sale comps support a filtered value range of ` +
+      `${low > 0 ? `$${Math.round(low).toLocaleString()}` : 'N/A'} to ` +
+      `${high > 0 ? `$${Math.round(high).toLocaleString()}` : 'N/A'}. ` +
+      `Selected ARV source: ${arv_source}. Selected as-is source: ${as_is_value_source}.`;
+  }
+
+  const property = {
+    address,
+    city,
+    state,
+    postal_code: postal,
+    list_price: moneyStr(listPrice),
+    est_value: as_is_value || null,
+    arv_value: arv || null,
+    beds,
+    baths,
+    year_built_mls: yearBuilt,
+    dom,
+    mls_description: mlsDesc || null,
+    mls: {
+      number: saleNode.mlsNumber || it.property?.mls?.number || null,
+      name: saleNode.mlsName || it.property?.mls?.name || null,
+      status: saleNode.status || it.property?.mls?.status || null,
+      listedDate: saleNode.listedDate || it.property?.mls?.listedDate || null,
+      lastSeenDate: saleNode.lastSeenDate || it.property?.mls?.lastSeenDate || null,
+      price_num: listPrice || 0
+    }
+  };
+
+  const existing_loan = {
+    balance: loanBalance || 0,
+    sellerMonthlyPaymentPI: round(sellerMonthlyPaymentPI || 0, 2),
+    rate: loanRate || 0,
+    original_principal: originalPrincipal || 0,
+    ltv: ltv !== null ? Number(ltv.toFixed(4)) : null
+  };
+
+  const metrics = {
+    list_price: listPrice || 0,
+    as_is_value,
+    arv,
+    comp_low: compLow || 0,
+    comp_high: compHigh || 0,
+    price: listPrice || 0,
+    city,
+    state,
+    bedrooms: beds,
+    bathrooms: baths,
+    currentFullBaths: currentFullBaths || 0,
+    currentHalfBaths: currentHalfBaths || 0,
+    totalBathrooms: totalBathrooms || baths || 0,
+    propertyType: propType,
+    sqft,
+    yearBuilt,
+    grossRent: marketRent,
+    proFormaRent,
+    annualRent,
+    estimatedRepairCost,
+    repair_estimate_source,
+    repair_cost_per_sqft,
+    taxes,
+    insurance,
+    mgmt,
+    maint,
+    vacancy,
+    utilities,
+    opex,
+    noi,
+    estValue: as_is_value,
+    equity_pct: equity_pct !== null ? round(equity_pct, 2) : null,
+    tiMonthly: round(tiMonthly, 2),
+    breakEvenRentMonthly,
+    breakEvenGapMonthly,
+    rentNeededForDSCR120Existing,
+    baseDebtServiceAnnualPIOnly: debtServiceAnnualPIOnly,
+    baseDSCRPIOnly,
+    list_price_source: listPriceSource,
+    as_is_value_source,
+    as_is_value_confidence,
+    arv_source,
+    selected_comps_count: selectedComps.length,
+    selected_comps_valid_count: selectedCompsValidCount || selectedComps.length,
+    selected_comps_average_ppsqft: selectedCompsAvgPpsf || 0,
+    monthly_opex: monthlyOpex,
+    raw_value_candidates: {
+      selected_comps_est_arv: selectedCompsArv || 0,
+      selected_comps_avg_ppsf: selectedCompsAvgPpsf || 0,
+      normalized_est_arv: oppArv || 0,
+      normalized_est_value: normalizedEstValue || 0,
+      sale_avm_estimate: saleAvmEstimate || 0,
+      market_value_estimate: marketValueEstimate || 0,
+      comp_low: compLow || 0,
+      comp_mid: compMid || 0,
+      comp_high: compHigh || 0,
+      tax_assessed_value: taxAssessedValue || 0,
+      list_price: listPrice || 0
+    }
+  };
+
+  const config = {
+    insuranceRate,
+    mgmtRate,
+    maintRate,
+    vacancyRate,
+    utilitiesRate,
+    assignmentPctOfDown: 0.25,
+    closingCostRate: 0.08,
+    taxRate: defaultTaxRate
+  };
+
+  const rental_estimates = it.rental_estimates || null;
+
+  const padsplit_current_vs_target = {
+    ...(it.rental_models?.padsplit?.debug || {}),
+    currentRooms: padsplitCurrentRooms || null,
+    targetRooms: padsplitTargetRooms || null,
+    roomsToAdd: padsplitRoomsToAdd || 0,
+    currentBaths: padsplitCurrentBaths || null,
+    requiredBaths: padsplitRequiredBaths || null,
+    bathsToAdd: padsplitBathroomsToAdd || 0,
+    padsplitRentCandidate: finalPadsplitGrossRentMonthly || 0,
+    upliftMonthly: padsplitUpliftMonthly || 0,
+    totalRenoEstimate: padsplitRenoEstimate || 0,
+    supportedReno: padsplitSupportedReno || 0,
+    feasible: padsplitFeasible,
+    bathroomInfrastructureRisk: padsplitBathroomRisk || null,
+    officePresent,
+    gameRoomPresent
+  };
+
+  const rental_models = {
+    ...(it.rental_models || {}),
+    standard: {
+      ...(it.rental_models?.standard || {}),
+      grossRentMonthly: marketRent,
+      assumptions: {
+        vacancyRate,
+        mgmtRate,
+        maintRate,
+        utilitiesIncluded: !!rental.assumptions?.utilitiesIncluded
+      }
+    },
+    padsplit: {
+      ...(it.rental_models?.padsplit || {}),
+      allowed: padsplitAllowed,
+      feasible: padsplitFeasible,
+      grossRentMonthly: finalPadsplitGrossRentMonthly || 0,
+      assumptions: {
+        vacancyRate: padsplitVacancyRate,
+        mgmtRate: padsplitMgmtRate,
+        maintRate: padsplitMaintRate,
+        utilitiesIncluded: padsplitUtilitiesIncluded
+      },
+      debug: {
+        ...(it.rental_models?.padsplit?.debug || {}),
+        currentRooms: padsplitCurrentRooms || null,
+        targetRooms: padsplitTargetRooms || null,
+        roomsToAdd: padsplitRoomsToAdd || 0,
+        currentBaths: padsplitCurrentBaths || null,
+        requiredBaths: padsplitRequiredBaths || null,
+        bathsToAdd: padsplitBathroomsToAdd || 0,
+        roomRent: finalPadsplitGrossRentMonthly && padsplitTargetRooms > 0
+          ? round(finalPadsplitGrossRentMonthly / padsplitTargetRooms, 2)
+          : null,
+        standardRent: marketRent,
+        padsplitRentCandidate: finalPadsplitGrossRentMonthly || 0,
+        upliftMonthly: padsplitUpliftMonthly || 0,
+        renoEstimate: padsplitRenoEstimate || 0,
+        supportedReno: padsplitSupportedReno || 0,
+        totalRenoEstimate: padsplitRenoEstimate || 0,
+        feasible: padsplitFeasible,
+        bathroomInfrastructureRisk: padsplitBathroomRisk || null,
+        officePresent,
+        gameRoomPresent,
+        inferredRoomMix: padsplit_room_mix
+      }
+    }
+  };
+
+  const canonical = {
+    rental_model: canonicalKey,
+    economics: {
+      grossRentMonthly: marketRent,
+      annualRent,
+      opexAnnual: opex,
+      NOI: noi,
+      ADS: null,
+      DSCR: null,
+      monthlyCF: null,
+      annualCF: null,
+      totalCashIn: null,
+      CoC_pct: null
+    }
+  };
+
+  results.push({
+    json: {
+      ...it,
+      estimated_arv: arv || 0,
+      selected_comps: selectedComps,
+      comp_properties_report,
+      comps_summary,
+      property,
+      rental_estimates,
+      rental_models,
+      existing_loan,
+      metrics,
+      config,
+      canonical,
+      padsplit_room_mix,
+      padsplit_expenses,
+      padsplit_current_vs_target,
+      warnings
+    }
+  });
+}
+
+return results;
