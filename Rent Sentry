@@ -1,0 +1,108 @@
+// 🛡️ Rent Sentry — single-output, production-safe
+function n(x) { return Number(String(x ?? '').replace(/[^\d.\-]/g, '')) || 0; }
+
+const it = $json;
+const m = it.metrics || {};
+const r = it.rental_estimates || {};
+
+// 🚨 GRAB THE NEW FLAWLESS RESOLVED OBJECT 🚨
+const res = it.resolved || {};
+
+// Forbidden contact-level field (always treated as 0)
+const banned = n(r.from_webhook_monthly_income || 0);
+
+// Upstream Nodes
+const compsNode = (() => { try { return $('Fetch rental comps').first().json || {}; } catch { return {}; } })();
+const marketNode = (() => { try { return $('Market Rental/Sale Data').first().json || {}; } catch { return {}; } })();
+
+// Allowed sources only
+const dealLow = n(r.from_deal_sauce_low);
+const dealHigh = n(r.from_deal_sauce_high);
+const compLow = n(r.from_comp_pull_low) || n(compsNode.rentRangeLow);
+const compHigh = n(r.from_comp_pull_high) || n(compsNode.rentRangeHigh);
+const metricsGross = n(m.grossRent);
+
+// ---------------------------------------------------------
+// NEW FALLBACK: Market Data by Property Type & Bedrooms
+// ---------------------------------------------------------
+let marketRent = 0;
+try {
+  if (marketNode.rentalData) {
+     const pTypeStr = String(res.property_type_for_rent || 'Single Family').toLowerCase();
+     const beds = n(res.building_beds || 3); // 🚨 Uses scalable beds
+     
+     // Find matching property type averages
+     let pTypeMatch = (marketNode.rentalData.dataByPropertyType || []).find(d => String(d.propertyType).toLowerCase().includes(pTypeStr.replace('single family', 'single')));
+     let typeRent = pTypeMatch ? n(pTypeMatch.averageRent) : 0;
+     
+     // Find matching bedroom averages
+     let bedMatch = (marketNode.rentalData.dataByBedrooms || []).find(d => n(d.bedrooms) === beds);
+     let bedRent = bedMatch ? n(bedMatch.averageRent) : 0;
+     
+     // Blend them, or pick whichever is valid
+     if (typeRent > 0 && bedRent > 0) marketRent = Math.round((typeRent + bedRent) / 2);
+     else if (typeRent > 0) marketRent = typeRent;
+     else if (bedRent > 0) marketRent = bedRent;
+     else marketRent = n(marketNode.rentalData.averageRent) || 0; // Absolute average if all else fails
+  }
+} catch (e) {
+  // Silent fail
+}
+
+// ---------------------------------------------------------
+
+// Pick monthly in a stable order (never use banned)
+let chosenMonthly = 0;
+if (metricsGross > 0) {
+  chosenMonthly = metricsGross;
+} else if (compLow && compHigh) {
+  chosenMonthly = Math.round((compLow + compHigh) / 2);
+} else if (dealLow && dealHigh) {
+  chosenMonthly = Math.round((dealLow + dealHigh) / 2);
+} else if (n(compsNode.rent) > 0) {
+  chosenMonthly = n(compsNode.rent);
+} else if (marketRent > 0) {
+  chosenMonthly = marketRent;
+}
+
+// 🛡️ Bulletproof Fallback: The 0.8% Rule if all APIs fail
+if (chosenMonthly === 0) {
+  const listPrice = it.property?.list_price ? n(it.property.list_price) : (n(m.list_price) || n(m.price) || 0);
+  if (listPrice > 0) {
+    chosenMonthly = Math.round(listPrice * 0.008);
+  } else {
+    const asIsValue = n(it.property?.est_value) || n(m.as_is_value) || n(m.estValue) || 0;
+    if (asIsValue > 0) {
+      chosenMonthly = Math.round(asIsValue * 0.008);
+    }
+  }
+}
+
+const ok = chosenMonthly > 0;
+const annual = ok ? chosenMonthly * 12 : 0;
+
+// Write a clear watchdog annotation
+it.watchdog = {
+  rent_status: ok ? "OK" : "MISSING",
+  severity: ok ? "INFO" : "ALERT",
+  banned_rent_detected: banned > 0,
+  chosen_rent: chosenMonthly,
+  sources: {
+    deal_low: dealLow,
+    deal_high: dealHigh,
+    comp_low: compLow,
+    comp_high: compHigh,
+    market_rent: marketRent,
+    metrics_gross: metricsGross
+  }
+};
+
+// Patch metrics only if missing; never zero-out a good value
+it.metrics = {
+  ...m,
+  grossRent: ok ? chosenMonthly : (m.grossRent || 0),
+  annualRent: ok ? annual : (m.annualRent || 0)
+};
+
+// Always return exactly one array of one object
+return [{ json: it }];
