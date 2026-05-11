@@ -1,0 +1,105 @@
+// ==============================
+// PACK AGENT v4 - Stage Router Passthrough
+// ==============================
+
+function get(node, fallback = {}) {
+  try {
+    const v = $(node).first().json;
+    return v ? v : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// Pull from upstream
+const dealMathNode = get('OFFER ENGINE v1');
+const metricsNode = get('Compute Metrics v2');
+const propertyData = get('HTTP Request6');
+const publicRecord = propertyData;
+
+const fetchSale = get('Fetch Sale Data');
+const fetchRent = get('Fetch rental comps');
+const fetchComps = get('Selected Comps');
+const webhook = get('Start Webhook1');
+const workflow = get('Execute Workflow');
+const analyzer = get('Phone Transcript analyzer');
+const resolveRent = get('Resolve Rental Model');
+const stageRouter = get('Evaluation & Stage Router');
+const marketDataExtracted = get('Information Extractor').output || {};
+const normalized = get('Normalize Subject + Mode') || {};
+const dedup = get('Deduplicate Opportunities') || {};
+const resolved = normalized.resolved || dedup.resolved || {};
+
+const customData = webhook.body?.customData || {};
+const loanData = dealMathNode.existing_loan || metricsNode.existing_loan || {};
+
+const buyerMatches = stageRouter.buyer_matches || [];
+
+let soldCompsList = [];
+if (fetchComps?.selected_comps && Array.isArray(fetchComps.selected_comps)) {
+  soldCompsList = fetchComps.selected_comps.map(c => ({
+    address: c.formattedAddress,
+    price: c.price,
+    propType: c.propType,
+    bedrooms: c.bedrooms,
+    bathrooms: c.bathrooms,
+    squareFootage: c.squareFootage,
+    yrBuilt: c.yearBuilt,
+    lotSqft: c.lotSqft,
+    pricePerSqFt: c.pricePerSqFt,
+    DOM: c.daysOnMarket,
+    distance: c.distance,
+    correlation: c.correlation
+  }));
+}
+
+const payload = {
+  deal_structure: dealMathNode.deal_structure || dealMathNode.output?.deal_structure || {},
+  investors_analysis: dealMathNode.investors_analysis || dealMathNode.output?.investors_analysis || {},
+  loi: dealMathNode.loi || dealMathNode.output?.loi || "",
+
+  public_property_data: publicRecord,
+  property: dealMathNode.property || metricsNode.property || {},
+  metrics: dealMathNode.metrics || metricsNode.metrics || {},
+  config: dealMathNode.config || metricsNode.config || {},
+
+  existing_loan: loanData,
+  market_data_trends: marketDataExtracted,
+  standard_monthly_rent: resolveRent.standard_rent_monthly,
+  rent_calculations: resolveRent.rent_calculations || {},
+  rental_estimates: resolveRent.rental_estimates || {},
+
+  normalized_subject: resolved || {}, 
+
+  buyer_matches: buyerMatches,
+  buyer_match_summary: stageRouter.buyer_match_summary,
+  comps_source: {
+    arv: fetchComps.estARV || null,
+    comp_low: fetchComps.priceRangeLow || null,
+    comp_high: fetchComps.priceRangeHigh || null,
+    comparables: soldCompsList
+  },
+
+  // Stage router passthrough
+  leadScore: stageRouter.leadScore ?? stageRouter.lead_score ?? null,
+  lead_score: stageRouter.lead_score ?? stageRouter.leadScore ?? null,
+  lead_score_version: stageRouter.lead_score_version || null,
+  lead_score_explanation: stageRouter.lead_score_explanation || "",
+  recommendation: stageRouter.recommendation || {},
+
+  execution_context: stageRouter.execution_context || stageRouter.output?.execution_context || "unknown",
+  precall_priority_score: stageRouter.precall_priority_score ?? null,
+  postcall_actionability_score: stageRouter.postcall_actionability_score ?? null,
+
+  seller_stance: stageRouter.seller_stance || {},
+  seller_acceptance: stageRouter.seller_acceptance || {},
+  score_breakdown: stageRouter.score_breakdown || {},
+  pricing_reality: stageRouter.seller_acceptance?.pricing_reality || stageRouter.recommendation?.pricingReality || {},
+
+  sale_listing_source: fetchSale || {},
+  rental_comps_source: fetchRent || {},
+  webhook_custom_data: customData,
+  transcript: analyzer || ""
+};
+
+return [{ json: payload }];
