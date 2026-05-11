@@ -1,0 +1,82 @@
+// ==========================
+// BUILD STANDARD RENT
+// Resolves ONE market rent + preserves rent signals
+// ==========================
+
+function parseMoney(x) {
+  if (x === undefined || x === null) return 0;
+  if (typeof x === 'number') return x;
+  const s = String(x).replace(/[^\d.\-]/g, '');
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+const rentalNode = (() => {
+  try { return $('Fetch rental comps').first().json || {}; }
+  catch { return {}; }
+})();
+
+const rent_low  = parseMoney(rentalNode.rentRangeLow);
+const rent_high = parseMoney(rentalNode.rentRangeHigh);
+const rent_val  = parseMoney(rentalNode.rent);
+
+const cd = $json.customData || {};
+const cdLowA  = parseMoney(cd.lowRentEst || cd.RentalEstimateLow);
+const cdHighA = parseMoney(cd.highRentEst || cd.RentalEstimateHigh);
+
+const marketDataExtracted = $('Information Extractor').first()?.json?.output || undefined;
+
+let unit_rent_monthly = 0;
+
+if (rent_val) {
+  unit_rent_monthly = rent_val;
+} else if (rent_low && rent_high) {
+  unit_rent_monthly = Math.round((rent_low + rent_high) / 2);
+} else if (cdLowA && cdHighA) {
+  unit_rent_monthly = Math.round((cdLowA + cdHighA) / 2);
+}
+
+if (!unit_rent_monthly) {
+  throw new Error('Build Standard Rent: unable to resolve standard rent');
+}
+
+// 🚨 FLASHLIGHT: BULLETPROOF RESOLVED EXTRACTION 🚨
+// This forces n8n to fetch the unit count straight from the source normalizer
+const res = (() => {
+    try { const r = $('Normalize Subject + Mode').first().json; if (r && r.resolved) return r.resolved; } catch {}
+    try { const r = $('Deduplicate Opportunities').first().json; if (r && r.resolved) return r.resolved; } catch {}
+    return $json.resolved || {};
+})();
+
+const is_mf = res.is_multifamily || false;
+const units = res.unit_count || 1;
+
+// Scale to get Gross Building Rent
+const gross_rent_monthly = is_mf && units > 1 ? (unit_rent_monthly * units) : unit_rent_monthly;
+
+const standard_rent_monthly = gross_rent_monthly;
+
+return [{
+  json: {
+    ...$json,
+    market_data_extracted: marketDataExtracted,
+
+    // Authoritative rent used by all downstream logic (Gross Building Rent)
+    standard_rent_monthly,
+
+    rent_calculations: {
+      unit_rent_monthly,
+      gross_building_rent: standard_rent_monthly,
+      unit_count_multiplier_applied: units,
+      was_scaled_for_multifamily: (is_mf && units > 1)
+    },
+
+    rental_estimates: {
+      from_comp_pull_low: rent_low || 0,
+      from_comp_pull_high: rent_high || 0,
+      from_deal_sauce_low: cdLowA || 0,
+      from_deal_sauce_high: cdHighA || 0,
+      from_webhook_monthly_income: 0
+    }
+  }
+}];
