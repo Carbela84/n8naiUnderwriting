@@ -1,0 +1,1003 @@
+function safeNode(name, fallback) {
+  if (fallback === undefined) fallback = {};
+  try {
+    var v = $(name).first().json;
+    return v || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+function firstValue() {
+  for (var i = 0; i < arguments.length; i++) {
+    var v = arguments[i];
+    if (v === 0 || v === false) return v;
+    if (v === null || v === undefined) continue;
+    if (typeof v === 'string' && v.trim() === '') continue;
+    return v;
+  }
+  return null;
+}
+
+function nonEmptyObject() {
+  for (var i = 0; i < arguments.length; i++) {
+    var v = arguments[i];
+    if (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length) return v;
+  }
+  return {};
+}
+
+function hasAnyKey(obj, keys) {
+  if (!obj || typeof obj !== 'object') return false;
+  return keys.some(function(k) {
+    return obj[k] !== undefined && obj[k] !== null;
+  });
+}
+
+function toMoneyNumber(x) {
+  if (x === null || x === undefined || x === '') return null;
+  if (typeof x === 'number') return Number.isFinite(x) ? x : null;
+  var n = parseFloat(String(x).replace(/[^\d.\-]/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+function money(x, digits) {
+  if (digits === undefined) digits = 2;
+  var n = toMoneyNumber(x);
+  if (n === null) return '—';
+  return '$' + n.toLocaleString('en-US', {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  });
+}
+
+function pct(x, digits) {
+  if (digits === undefined) digits = 1;
+  if (x === null || x === undefined || x === '') return '—';
+  if (typeof x === 'string' && x.indexOf('%') >= 0) return x;
+  var n = toMoneyNumber(x);
+  if (n === null) return '—';
+  return n.toFixed(digits) + '%';
+}
+
+function clean(s) {
+  return String(s == null ? '' : s).replace(/\s+\n/g, '\n').trim();
+}
+
+function lower(s) {
+  return String(s == null ? '' : s).trim().toLowerCase();
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function nlToBr(s) {
+  return escapeHtml(s || '').replace(/\n/g, '<br>');
+}
+
+function isPresent(v) {
+  if (v === 0 || v === false) return true;
+  if (v === null || v === undefined) return false;
+  if (typeof v === 'string') {
+    var s = v.trim();
+    return s !== '' && s !== 'N/A' && s !== 'null' && s !== 'undefined';
+  }
+  return true;
+}
+
+function pushLine(lines, label, value, formatter) {
+  if (!isPresent(value)) return;
+  var out = formatter ? formatter(value) : value;
+  if (!isPresent(out)) return;
+  lines.push('• ' + label + ': ' + out);
+}
+
+function offerField(offer) {
+  for (var i = 1; i < arguments.length; i++) {
+    var key = arguments[i];
+    if (offer && offer[key] !== undefined && offer[key] !== null && offer[key] !== '') return offer[key];
+  }
+  return null;
+}
+
+function toDiscord(s) {
+  return String(s || '')
+    .replace(/^🏠/gm, '**🏠**')
+    .replace(/^🏦/gm, '**🏦**')
+    .replace(/^📊/gm, '**📊**')
+    .replace(/^💼/gm, '**💼**')
+    .replace(/^🧭/gm, '**🧭**')
+    .replace(/^📬/gm, '**📬**')
+    .replace(/^📌/gm, '**📌**')
+    .replace(/^👤/gm, '**👤**')
+    .replace(/^🗒️/gm, '**🗒️**')
+    .replace(/^🧰/gm, '**🧰**')
+    .replace(/^💵/gm, '**💵**')
+    .replace(/^🤖/gm, '**🤖**');
+}
+
+function scoreText(v, max) {
+  if (max === undefined) max = 10;
+  if (v === null || v === undefined || v === '') return 'N/A';
+  return String(v) + '/' + String(max);
+}
+
+function evalColor(evaluation) {
+  var v = lower(evaluation);
+  if (v.indexOf('hot') >= 0) return '#16a34a';
+  if (v.indexOf('warm') >= 0) return '#d97706';
+  if (v.indexOf('follow') >= 0) return '#2563eb';
+  if (v.indexOf('cold') >= 0) return '#64748b';
+  if (v.indexOf('dead') >= 0) return '#dc2626';
+  if (v.indexOf('manual') >= 0) return '#7c3aed';
+  return '#334155';
+}
+
+function scoreBadgeHtml(score) {
+  var n = toMoneyNumber(score);
+
+  if (n === null) {
+    return '<span style="display:inline-block;padding:5px 10px;border-radius:999px;background:#e5e7eb;color:#374151;font-weight:800;">N/A</span>';
+  }
+
+  var bg = '#dc2626';
+  if (n >= 9) bg = '#16a34a';
+  else if (n >= 7) bg = '#d97706';
+  else if (n >= 5) bg = '#2563eb';
+  else if (n >= 3) bg = '#64748b';
+
+  return '<span style="display:inline-block;padding:5px 10px;border-radius:999px;background:' + bg + ';color:white;font-weight:900;">' + String(n) + '/10</span>';
+}
+
+function explainEvaluation(bestScore) {
+  var s = toMoneyNumber(bestScore);
+  if (s === null) return 'Manual review because one or more scoring inputs were missing, conflicting, or unreliable.';
+  if (s >= 9) return 'Hot because at least one offer path appears highly likely to be seller-acceptable.';
+  if (s >= 7) return 'Warm because at least one offer path is plausible, but may still require negotiation.';
+  if (s >= 5) return 'Follow-Up because there may be a path, but seller acceptance is uncertain.';
+  if (s >= 3) return 'Cold because both offer paths appear unlikely without a major seller concession.';
+  return 'Dead because neither the cash nor creative path appears realistically acceptable.';
+}
+
+function getOfferByName(deal, name) {
+  if (!deal || typeof deal !== 'object') return {};
+  return deal[name] || {};
+}
+
+function buildContext(a) {
+  var aiNode = safeNode('AI Agent', {});
+  var oeNode = safeNode('OFFER ENGINE v1', {});
+
+  var current = a || {};
+  var currentOut = current.output || {};
+
+  var aiOut = nonEmptyObject(
+    aiNode.output,
+    current.ai_agent && current.ai_agent.output,
+    current.aiAgent && current.aiAgent.output,
+    {}
+  );
+
+  var oeOut = nonEmptyObject(
+    oeNode.output,
+    current.offer_engine && current.offer_engine.output,
+    current.offerEngine && current.offerEngine.output,
+    current.offer_generator && current.offer_generator.output,
+    {}
+  );
+
+  var currentDeal = firstValue(currentOut.deal_structure, current.deal_structure, {});
+  var aiDeal = firstValue(aiOut.deal_structure, {});
+  var oeDeal = firstValue(oeOut.deal_structure, currentDeal, {});
+
+  function mergeOffer(name) {
+    var base = firstValue(getOfferByName(oeDeal, name), getOfferByName(currentDeal, name), {});
+    var ai = firstValue(getOfferByName(aiDeal, name), {});
+    var merged = Object.assign({}, base);
+    if (isPresent(ai.Justification)) merged.Justification = ai.Justification;
+    return merged;
+  }
+
+  var acceptanceScoring = firstValue(
+    current.acceptance_scoring,
+    currentOut.acceptance_scoring,
+    oeOut.acceptance_scoring,
+    aiOut.acceptance_scoring,
+    {}
+  );
+
+  var recommendation = firstValue(
+    current.recommendation,
+    currentOut.recommendation,
+    oeOut.recommendation,
+    aiOut.recommendation,
+    {}
+  );
+
+  var sellerStance = firstValue(
+    current.seller_stance,
+    currentOut.seller_stance,
+    acceptanceScoring.seller_stance,
+    recommendation.seller_stance,
+    {}
+  );
+
+  var sellerFloor = firstValue(
+    current.seller_floor,
+    currentOut.seller_floor,
+    acceptanceScoring.seller_floor,
+    recommendation.seller_floor,
+    {}
+  );
+
+  return {
+    raw: current,
+    currentOut: currentOut,
+    aiOut: aiOut,
+    oeOut: oeOut,
+
+    property: firstValue(currentOut.property, current.property, oeOut.property, aiOut.property, {}),
+    metrics: firstValue(currentOut.metrics, current.metrics, oeOut.metrics, aiOut.metrics, {}),
+    existingLoan: firstValue(currentOut.existing_loan, current.existing_loan, oeOut.existing_loan, aiOut.existing_loan, {}),
+    config: firstValue(currentOut.config, current.config, oeOut.config, aiOut.config, {}),
+    transcript: firstValue(current.transcript, currentOut.transcript, oeOut.transcript, {}),
+
+    leadScore: firstValue(currentOut.lead_score, current.lead_score, current.leadScore, oeOut.lead_score, null),
+    leadScoreExplanation: firstValue(current.lead_score_explanation, currentOut.lead_score_explanation, aiOut.lead_score_explanation, oeOut.lead_score_explanation, null),
+
+    acceptanceScoring: acceptanceScoring,
+    recommendation: recommendation,
+
+    cashProbability: firstValue(current.cash_probability, currentOut.cash_probability, acceptanceScoring.cash_probability, recommendation.cash_probability, null),
+    creativeProbability: firstValue(current.creative_probability, currentOut.creative_probability, acceptanceScoring.creative_probability, recommendation.creative_probability, null),
+
+    underwritingEvaluation: firstValue(current.underwriting_evaluation, currentOut.underwriting_evaluation, acceptanceScoring.underwriting_evaluation, recommendation.underwritingEvaluation, null),
+    underwritingEvaluationLabel: firstValue(current.underwriting_evaluation_label, currentOut.underwriting_evaluation_label, acceptanceScoring.underwriting_evaluation_label, recommendation.evaluation, null),
+
+    bestAcceptanceScore: firstValue(current.best_acceptance_score, currentOut.best_acceptance_score, acceptanceScoring.best_acceptance_score, recommendation.best_acceptance_score, null),
+    bestAcceptancePath: firstValue(current.best_acceptance_path, currentOut.best_acceptance_path, acceptanceScoring.best_acceptance_path, recommendation.best_acceptance_path, null),
+
+    executionContext: firstValue(current.execution_context, currentOut.execution_context, acceptanceScoring.execution_context, recommendation.execution_context, null),
+    sellerStance: sellerStance,
+    sellerFloor: sellerFloor,
+
+    investorsAnalysis: firstValue(oeOut.investors_analysis, currentOut.investors_analysis, current.investors_analysis, {}),
+    investorsAnalysisInsights: firstValue(aiOut.investors_analysis_insights, oeOut.investors_analysis_insights, currentOut.investors_analysis_insights, null),
+
+    compsSummary: firstValue(aiOut.comps_summary, currentOut.comps_summary, current.comps_summary, null),
+    compPropertiesReport: firstValue(currentOut.comp_properties_report, current.comp_properties_report, oeOut.comp_properties_report, []),
+
+    buyerMatches: firstValue(currentOut.buyer_matches, current.buyer_matches, oeOut.buyer_matches, []),
+    buyerMatchSummary: firstValue(aiOut.buyer_match_summary, currentOut.buyer_match_summary, current.buyer_match_summary, null),
+
+    dispoStrategy: firstValue(aiOut.dispoStrategy, currentOut.dispoStrategy, current.dispoStrategy, {}),
+    finalRecommendationsAndInsights: firstValue(aiOut.finalRecommendationsAndInsights, currentOut.finalRecommendationsAndInsights, null),
+    loi: firstValue(aiOut.loi, currentOut.loi, null),
+
+    dealStructure: {
+      'Primary Offer': mergeOffer('Primary Offer'),
+      'Backup Offer': mergeOffer('Backup Offer'),
+      'Updated Cash Offer': mergeOffer('Updated Cash Offer')
+    },
+
+    cashOffer: firstValue(oeOut.cash_offer, currentOut.cash_offer, current.cash_offer, {}),
+    mao: firstValue(oeOut.mao, currentOut.mao, current.mao),
+    wholesaleFee: firstValue(oeOut.wholesale_fee, currentOut.wholesale_fee, current.wholesale_fee),
+    repairEstimate: firstValue(oeOut.repair_estimate, currentOut.repair_estimate, current.repair_estimate),
+    ctsEngine: firstValue(oeOut.cts_engine, currentOut.cts_engine, current.cts_engine, {}),
+    assignmentFeeRange: firstValue(oeOut.assignment_fee_range, currentOut.assignment_fee_range, current.assignment_fee_range),
+    estimatedArv: firstValue(currentOut.estimated_arv, current.estimated_arv, oeOut.estimated_arv, aiOut.estimated_arv)
+  };
+}
+
+function buildHeader(ctx) {
+  var p = ctx.property || {};
+  var address = [p.address, p.city, p.state, p.postal_code].filter(Boolean).join(', ') || '—';
+  var arv = money(firstValue(ctx.estimatedArv, p.arv_value, ctx.metrics.arv));
+  var asIs = money(firstValue(ctx.metrics.as_is_value, ctx.metrics.estValue, p.est_value));
+  var asking = money(firstValue(p.mls && p.mls.price_num, ctx.metrics.list_price, ctx.metrics.price, p.list_price));
+
+  var lines = [];
+  lines.push('🏠 Property: ' + address);
+  lines.push('ARV: ' + arv + '  |  As-Is: ' + asIs + '  |  Asking: ' + asking);
+
+  if (isPresent(ctx.underwritingEvaluationLabel)) lines.push('Underwriting Evaluation: ' + ctx.underwritingEvaluationLabel);
+  if (isPresent(ctx.leadScore)) lines.push('Acceptance Score: ' + ctx.leadScore);
+
+  return lines.join('\n');
+}
+
+function buildHeaderHtml(ctx) {
+  var p = ctx.property || {};
+  var address = [p.address, p.city, p.state, p.postal_code].filter(Boolean).join(', ') || '—';
+  var arv = money(firstValue(ctx.estimatedArv, p.arv_value, ctx.metrics.arv));
+  var asIs = money(firstValue(ctx.metrics.as_is_value, ctx.metrics.estValue, p.est_value));
+  var asking = money(firstValue(p.mls && p.mls.price_num, ctx.metrics.list_price, ctx.metrics.price, p.list_price));
+  var label = ctx.underwritingEvaluationLabel || 'Underwriting Evaluation';
+  var color = evalColor(label);
+
+  return [
+    '<div style="font-family:Arial,Helvetica,sans-serif;border-radius:16px;overflow:hidden;border:1px solid #dbe3ef;background:#ffffff;margin-bottom:16px;">',
+    '<div style="background:' + color + ';color:white;padding:16px 18px;">',
+    '<div style="font-size:20px;font-weight:900;line-height:1.25;">' + escapeHtml(address) + '</div>',
+    '<div style="font-size:13px;margin-top:6px;opacity:.95;">' + escapeHtml(label) + '</div>',
+    '</div>',
+    '<div style="padding:14px 18px;background:#f8fafc;">',
+    '<table style="width:100%;border-collapse:collapse;font-size:13px;"><tr>',
+    '<td style="padding:6px 8px;color:#64748b;font-weight:800;">ARV</td><td style="padding:6px 8px;color:#0f172a;font-weight:900;">' + escapeHtml(arv) + '</td>',
+    '<td style="padding:6px 8px;color:#64748b;font-weight:800;">As-Is</td><td style="padding:6px 8px;color:#0f172a;font-weight:900;">' + escapeHtml(asIs) + '</td>',
+    '<td style="padding:6px 8px;color:#64748b;font-weight:800;">Asking</td><td style="padding:6px 8px;color:#0f172a;font-weight:900;">' + escapeHtml(asking) + '</td>',
+    '</tr></table>',
+    '</div>',
+    '</div>'
+  ].join('');
+}
+
+function buildAcceptanceScoringText(ctx) {
+  var acc = ctx.acceptanceScoring || {};
+  var rec = ctx.recommendation || {};
+
+  var cashScore = firstValue(ctx.cashProbability, acc.cash_probability, rec.cash_probability);
+  var creativeScore = firstValue(ctx.creativeProbability, acc.creative_probability, rec.creative_probability);
+  var bestScore = firstValue(ctx.bestAcceptanceScore, acc.best_acceptance_score, rec.best_acceptance_score);
+  var bestPath = firstValue(ctx.bestAcceptancePath, acc.best_acceptance_path, rec.best_acceptance_path, 'unknown');
+  var underwritingEvaluation = firstValue(ctx.underwritingEvaluationLabel, ctx.underwritingEvaluation, acc.underwriting_evaluation_label, rec.evaluation, 'N/A');
+  var executionContext = firstValue(ctx.executionContext, acc.execution_context, rec.execution_context, 'unknown');
+  var sellerFloor = firstValue(ctx.sellerFloor, acc.seller_floor, rec.seller_floor, {});
+  var stance = firstValue(ctx.sellerStance, acc.seller_stance, rec.seller_stance, {});
+  var cashBreakdown = acc.cash_probability_breakdown || {};
+  var creativeBreakdown = acc.creative_probability_breakdown || {};
+  var manualReasons = acc.manual_review_reasons || rec.manual_review_reasons || [];
+
+  var lines = [];
+
+  lines.push('🤖 Underwriting Acceptance Scoring');
+  lines.push('• Execution Context: ' + executionContext);
+  lines.push('• Cash Probability: ' + scoreText(cashScore));
+  lines.push('• Creative Probability: ' + scoreText(creativeScore));
+  lines.push('• Best Path: ' + (bestPath || 'N/A'));
+  lines.push('• Underwriting Evaluation: ' + underwritingEvaluation);
+  lines.push('• Seller Floor: ' + (sellerFloor.formatted || money(sellerFloor.value, 0)));
+  lines.push('• Seller Floor Source: ' + (sellerFloor.source || 'N/A') + ' (' + (sellerFloor.confidence || 'unknown') + ' confidence)');
+  lines.push('• Seller Urgency: ' + (stance.urgency_band || 'unknown'));
+  lines.push('• Price Flexibility: ' + (stance.price_flexibility || 'unknown'));
+  lines.push('• Creative Openness: ' + (stance.terms_openness || 'unknown'));
+
+  if (executionContext === 'pre_call') lines.push('• Context Note: Pre-call scoring uses public/inferred seller signals only. Seller motivation is not confirmed yet.');
+  if (executionContext === 'post_call') lines.push('• Context Note: Post-call scoring uses transcript/seller/agent evidence.');
+
+  lines.push('• Why: ' + explainEvaluation(bestScore));
+
+  if (Array.isArray(cashBreakdown.reasons) && cashBreakdown.reasons.length) {
+    lines.push('• Cash Score Notes:');
+    cashBreakdown.reasons.slice(0, 5).forEach(function(r) {
+      lines.push('•   - ' + r);
+    });
+  }
+
+  if (Array.isArray(creativeBreakdown.reasons) && creativeBreakdown.reasons.length) {
+    lines.push('• Creative Score Notes:');
+    creativeBreakdown.reasons.slice(0, 6).forEach(function(r) {
+      lines.push('•   - ' + r);
+    });
+  }
+
+  if (Array.isArray(manualReasons) && manualReasons.length) {
+    lines.push('• Manual Review Reasons:');
+    manualReasons.forEach(function(r) {
+      lines.push('•   - ' + r);
+    });
+  }
+
+  if (isPresent(ctx.leadScoreExplanation)) lines.push('• Router Explanation: ' + clean(ctx.leadScoreExplanation));
+
+  return lines.join('\n');
+}
+
+function buildAcceptanceScoringHtml(ctx) {
+  var acc = ctx.acceptanceScoring || {};
+  var rec = ctx.recommendation || {};
+
+  var cashScore = firstValue(ctx.cashProbability, acc.cash_probability, rec.cash_probability);
+  var creativeScore = firstValue(ctx.creativeProbability, acc.creative_probability, rec.creative_probability);
+  var bestScore = firstValue(ctx.bestAcceptanceScore, acc.best_acceptance_score, rec.best_acceptance_score);
+  var bestPath = firstValue(ctx.bestAcceptancePath, acc.best_acceptance_path, rec.best_acceptance_path, 'unknown');
+  var underwritingEvaluation = firstValue(ctx.underwritingEvaluationLabel, ctx.underwritingEvaluation, acc.underwriting_evaluation_label, rec.evaluation, 'N/A');
+  var executionContext = firstValue(ctx.executionContext, acc.execution_context, rec.execution_context, 'unknown');
+  var sellerFloor = firstValue(ctx.sellerFloor, acc.seller_floor, rec.seller_floor, {});
+  var stance = firstValue(ctx.sellerStance, acc.seller_stance, rec.seller_stance, {});
+  var cashBreakdown = acc.cash_probability_breakdown || {};
+  var creativeBreakdown = acc.creative_probability_breakdown || {};
+  var manualReasons = acc.manual_review_reasons || rec.manual_review_reasons || [];
+
+  var color = evalColor(underwritingEvaluation);
+  var contextLabel = executionContext === 'pre_call'
+    ? 'Pre-call: seller motivation is inferred from public signals only.'
+    : executionContext === 'post_call'
+      ? 'Post-call: seller/agent transcript evidence is included.'
+      : 'Execution context unknown.';
+
+  var pathLabel = bestPath === 'creative'
+    ? 'Creative offer is the stronger seller-acceptance path.'
+    : bestPath === 'cash'
+      ? 'Cash offer is the stronger seller-acceptance path.'
+      : bestPath === 'manual_review'
+        ? 'Manual review required before trusting the score.'
+        : 'No clear winning path detected.';
+
+  var sellerFloorHtml = sellerFloor && isPresent(sellerFloor.formatted) ? sellerFloor.formatted : money(sellerFloor && sellerFloor.value, 0);
+
+  var cashReasons = Array.isArray(cashBreakdown.reasons) ? cashBreakdown.reasons.slice(0, 5) : [];
+  var creativeReasons = Array.isArray(creativeBreakdown.reasons) ? creativeBreakdown.reasons.slice(0, 6) : [];
+
+  var cashReasonHtml = cashReasons.length
+    ? '<ul style="margin:0 0 0 18px;padding:0;color:#334155;line-height:1.45;font-size:13px;">' + cashReasons.map(function(r) { return '<li>' + escapeHtml(r) + '</li>'; }).join('') + '</ul>'
+    : '<div style="color:#64748b;font-size:13px;">No cash breakdown available.</div>';
+
+  var creativeReasonHtml = creativeReasons.length
+    ? '<ul style="margin:0 0 0 18px;padding:0;color:#334155;line-height:1.45;font-size:13px;">' + creativeReasons.map(function(r) { return '<li>' + escapeHtml(r) + '</li>'; }).join('') + '</ul>'
+    : '<div style="color:#64748b;font-size:13px;">No creative breakdown available.</div>';
+
+  var manualHtml = '';
+  if (Array.isArray(manualReasons) && manualReasons.length) {
+    manualHtml =
+      '<div style="margin-top:14px;padding:12px 14px;border-radius:12px;background:#fef3c7;border:1px solid #f59e0b;color:#78350f;">' +
+      '<div style="font-weight:900;margin-bottom:5px;">Manual Review Reasons</div>' +
+      '<ul style="margin:6px 0 0 18px;padding:0;line-height:1.45;">' +
+      manualReasons.map(function(r) { return '<li>' + escapeHtml(r) + '</li>'; }).join('') +
+      '</ul></div>';
+  }
+
+  return [
+    '<div style="font-family:Arial,Helvetica,sans-serif;border:1px solid #dbe3ef;border-radius:16px;overflow:hidden;margin:18px 0;background:#ffffff;">',
+    '<div style="background:' + color + ';color:#ffffff;padding:15px 18px;">',
+    '<div style="font-size:19px;font-weight:900;">Underwriting Evaluation: ' + escapeHtml(underwritingEvaluation) + '</div>',
+    '<div style="font-size:13px;opacity:.95;margin-top:5px;">' + escapeHtml(contextLabel) + '</div>',
+    '</div>',
+
+    '<div style="padding:16px 18px;">',
+
+    '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">',
+    '<div style="flex:1;min-width:175px;border:1px solid #e5e7eb;border-radius:13px;padding:13px;background:#f8fafc;">',
+    '<div style="font-size:11px;color:#64748b;text-transform:uppercase;font-weight:900;letter-spacing:.4px;">Cash Probability</div>',
+    '<div style="font-size:22px;font-weight:900;margin-top:8px;">' + scoreBadgeHtml(cashScore) + '</div>',
+    '<div style="font-size:12px;color:#475569;margin-top:7px;line-height:1.35;">Cash offer vs estimated seller floor.</div>',
+    '</div>',
+
+    '<div style="flex:1;min-width:175px;border:1px solid #e5e7eb;border-radius:13px;padding:13px;background:#f8fafc;">',
+    '<div style="font-size:11px;color:#64748b;text-transform:uppercase;font-weight:900;letter-spacing:.4px;">Creative Probability</div>',
+    '<div style="font-size:22px;font-weight:900;margin-top:8px;">' + scoreBadgeHtml(creativeScore) + '</div>',
+    '<div style="font-size:12px;color:#475569;margin-top:7px;line-height:1.35;">Creative offer vs seller openness, price, down, and terms.</div>',
+    '</div>',
+
+    '<div style="flex:1;min-width:175px;border:1px solid #e5e7eb;border-radius:13px;padding:13px;background:#f8fafc;">',
+    '<div style="font-size:11px;color:#64748b;text-transform:uppercase;font-weight:900;letter-spacing:.4px;">Best Path</div>',
+    '<div style="font-size:18px;font-weight:900;margin-top:8px;text-transform:capitalize;color:#0f172a;">' + escapeHtml(bestPath || 'N/A') + '</div>',
+    '<div style="font-size:12px;color:#475569;margin-top:7px;line-height:1.35;">' + escapeHtml(pathLabel) + '</div>',
+    '</div>',
+    '</div>',
+
+    '<div style="padding:12px 14px;border-left:4px solid ' + color + ';background:#f8fafc;border-radius:10px;margin-bottom:14px;">',
+    '<div style="font-size:14px;font-weight:900;color:#0f172a;">Why it scored this way</div>',
+    '<div style="font-size:13px;color:#334155;line-height:1.45;margin-top:5px;">' + escapeHtml(explainEvaluation(bestScore)) + '</div>',
+    '</div>',
+
+    '<table style="width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;"><tbody>',
+    '<tr><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#64748b;font-weight:800;width:38%;">Seller Floor</td><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#0f172a;font-weight:900;">' + escapeHtml(sellerFloorHtml) + '</td></tr>',
+    '<tr><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#64748b;font-weight:800;">Floor Source</td><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#0f172a;">' + escapeHtml(sellerFloor.source || 'N/A') + ' (' + escapeHtml(sellerFloor.confidence || 'unknown') + ' confidence)</td></tr>',
+    '<tr><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#64748b;font-weight:800;">Seller Urgency</td><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#0f172a;">' + escapeHtml(stance.urgency_band || 'unknown') + '</td></tr>',
+    '<tr><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#64748b;font-weight:800;">Price Flexibility</td><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#0f172a;">' + escapeHtml(stance.price_flexibility || 'unknown') + '</td></tr>',
+    '<tr><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#64748b;font-weight:800;">Creative Openness</td><td style="padding:8px;border-bottom:1px solid #e5e7eb;color:#0f172a;">' + escapeHtml(stance.terms_openness || 'unknown') + '</td></tr>',
+    '</tbody></table>',
+
+    '<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:14px;">',
+    '<div style="flex:1;min-width:240px;border:1px solid #e5e7eb;border-radius:13px;padding:13px;background:#ffffff;"><div style="font-weight:900;color:#0f172a;margin-bottom:7px;">Cash Score Notes</div>' + cashReasonHtml + '</div>',
+    '<div style="flex:1;min-width:240px;border:1px solid #e5e7eb;border-radius:13px;padding:13px;background:#ffffff;"><div style="font-weight:900;color:#0f172a;margin-bottom:7px;">Creative Score Notes</div>' + creativeReasonHtml + '</div>',
+    '</div>',
+
+    manualHtml,
+
+    '<div style="font-size:12px;color:#64748b;margin-top:14px;line-height:1.45;"><strong>How to read this:</strong> Underwriting Evaluation is based on the highest seller-acceptance path between cash and creative. It is not a separate investor-quality score.</div>',
+    '</div></div>'
+  ].join('');
+}
+
+function buildInvestorsAnalysis(ctx) {
+  var ia = ctx.investorsAnalysis || {};
+  var lines = [];
+
+  lines.push('📊 Investors Analysis');
+  pushLine(lines, 'Gross Rent', ia['Gross Rent']);
+  pushLine(lines, 'Annual Rent', ia['Annual Rent']);
+  pushLine(lines, 'Operating Expenses', ia['Operating Expenses']);
+  pushLine(lines, 'NOI', ia['NOI']);
+  pushLine(lines, 'Annual Debt Service (ADS)', ia['Annual Debt Service (ADS)']);
+  pushLine(lines, 'DSCR', ia['DSCR']);
+  pushLine(lines, 'Monthly Cash-flow', ia['Monthly Cash-flow']);
+  pushLine(lines, 'Annual Cash-flow', ia['Annual Cash-flow']);
+  pushLine(lines, 'Break-even Rent', ia['Break-even Rent']);
+  pushLine(lines, 'Rent Gap to Break-even', ia['Rent Gap to Break-even']);
+  pushLine(lines, 'Cash Flow Profile', ia['Cash Flow Profile']);
+  pushLine(lines, 'Years to Recapture Cash In', ia['Years to Recapture Cash In']);
+  pushLine(lines, 'Total Cash In', ia['Total Cash In']);
+  pushLine(lines, 'Cash-on-Cash Return', ia['Cash-on-Cash Return']);
+  pushLine(lines, '2% Rule', ia['2% Rule']);
+  pushLine(lines, '50% Rule', ia['50% Rule']);
+
+  if (isPresent(ctx.investorsAnalysisInsights)) {
+    lines.push('• Insight: ' + clean(ctx.investorsAnalysisInsights));
+  }
+
+  return lines.join('\n');
+}
+
+function buildOfferSection(title, offer) {
+  if (!offer || !isPresent(offer.Type || offer.offer_type)) return title + '\n• —';
+
+  var type = firstValue(offer.offer_type, offer.Type, 'Offer');
+  var typeKey = lower(type);
+  var lines = [];
+
+  lines.push(title);
+  lines.push('• Type: ' + type);
+
+  pushLine(lines, 'Purchase Price', offerField(offer, 'Purchase Price'));
+  pushLine(lines, 'Requested Price', offerField(offer, 'Requested Price'));
+  pushLine(lines, 'Target DSCR', offerField(offer, 'Target DSCR'));
+  pushLine(lines, 'DSCR-Adjusted Price', offerField(offer, 'DSCR-Adjusted Price'));
+  pushLine(lines, 'Price Adjusted for DSCR', offerField(offer, 'Price Adjusted for DSCR'));
+
+  if (typeKey.indexOf('subject') >= 0) {
+    pushLine(lines, 'CTS', offerField(offer, 'cts', 'CTS ($)', 'Cash to Seller'));
+    pushLine(lines, 'CTS %', offerField(offer, 'cts_pct', 'CTS (%)'));
+    pushLine(lines, 'Existing Loan Balance', offerField(offer, 'existing_loan_balance', 'Existing Loan Balance'));
+    pushLine(lines, 'Existing Loan Rate', offerField(offer, 'existing_loan_rate', 'Existing Loan Interest Rate', 'Loan Rate (%)', 'Interest Rate (%)'));
+    pushLine(lines, 'Existing Loan Monthly PI', offerField(offer, 'existing_loan_monthly_pi', 'Existing Loan Monthly Payment (PI)', 'Monthly Payment (PI)'));
+    pushLine(lines, 'Combined Monthly PI', offerField(offer, 'combined_monthly_pi', 'Combined Monthly Payment (PI)'));
+  } else if (typeKey.indexOf('hybrid') >= 0) {
+    pushLine(lines, 'CTS', offerField(offer, 'cts', 'CTS ($)', 'Cash to Seller'));
+    pushLine(lines, 'CTS %', offerField(offer, 'cts_pct', 'CTS (%)'));
+    pushLine(lines, 'Existing Loan Balance', offerField(offer, 'existing_loan_balance', 'Existing Loan Balance'));
+    pushLine(lines, 'Existing Loan Rate', offerField(offer, 'existing_loan_rate', 'Existing Loan Interest Rate'));
+    pushLine(lines, 'Existing Loan Monthly PI', offerField(offer, 'existing_loan_monthly_pi', 'Existing Loan Monthly Payment (PI)'));
+    pushLine(lines, 'Seller Carry Principal', offerField(offer, 'seller_carry_principal', 'Seller Carryback Loan'));
+    pushLine(lines, 'Seller Carry Rate', offerField(offer, 'seller_carry_rate', 'Seller Carryback Interest Rate'));
+    pushLine(lines, 'Seller Carry Amort Years', offerField(offer, 'seller_carry_amort_years'));
+    pushLine(lines, 'Seller Carry Balloon Years', offerField(offer, 'seller_carry_balloon_years', 'Balloon Term (Years)'));
+    pushLine(lines, 'Seller Carry Monthly PI', offerField(offer, 'seller_carry_monthly_pi', 'Seller Carryback Monthly Payment (PI)'));
+    pushLine(lines, 'Combined Monthly PI', offerField(offer, 'combined_monthly_pi', 'Combined Monthly Payment (PI)'));
+  } else {
+    pushLine(lines, 'Down Payment', offerField(offer, 'down_payment', 'Down Payment ($)'));
+    pushLine(lines, 'Down Payment %', offerField(offer, 'down_payment_pct', 'Down Payment (%)'));
+    pushLine(lines, 'Seller Carry Principal', offerField(offer, 'seller_carry_principal', 'Seller Carryback Loan', 'Financed Amount'));
+    pushLine(lines, 'Seller Carry Rate', offerField(offer, 'seller_carry_rate', 'Seller Carryback Interest Rate', 'Loan Rate (%)', 'Interest Rate (%)'));
+    pushLine(lines, 'Seller Carry Amort Years', offerField(offer, 'seller_carry_amort_years', 'Amortization (Years)'));
+    pushLine(lines, 'Seller Carry Balloon Years', offerField(offer, 'seller_carry_balloon_years', 'Balloon Term (Years)'));
+    pushLine(lines, 'Seller Carry Monthly PI', offerField(offer, 'seller_carry_monthly_pi', 'Seller Carryback Monthly Payment (PI)', 'Monthly Payment (PI)'));
+  }
+
+  pushLine(lines, 'Monthly Taxes and Insurance (TI)', offerField(offer, 'Monthly Taxes and Insurance (TI)', 'Monthly Taxes & Insurance'));
+  pushLine(lines, 'ADS', offerField(offer, 'ADS'));
+  pushLine(lines, 'DSCR', offerField(offer, 'DSCR'));
+  pushLine(lines, 'Monthly Cash-flow', offerField(offer, 'Monthly Cash-flow'));
+  pushLine(lines, 'Annual Cash-flow', offerField(offer, 'Annual Cash-flow'));
+  pushLine(lines, 'Break-even Rent', offerField(offer, 'Break-even Rent'));
+  pushLine(lines, 'Rent Gap to Break-even', offerField(offer, 'Rent Gap to Break-even'));
+  pushLine(lines, 'Rent Needed for Target DSCR', offerField(offer, 'Rent Needed for Target DSCR'));
+  pushLine(lines, 'Rent Gap to Target DSCR', offerField(offer, 'Rent Gap to Target DSCR'));
+  pushLine(lines, 'Cash Flow Profile', offerField(offer, 'Cash Flow Profile'));
+  pushLine(lines, 'Years to Recapture Cash In', offerField(offer, 'Years to Recapture Cash In'));
+  pushLine(lines, 'Total Entry Fee', offerField(offer, 'total_entry_fee', 'Total Entry Fee'));
+  pushLine(lines, 'Cash-on-Cash Return', offerField(offer, 'Cash-on-Cash Return'));
+
+  if (isPresent(offer.Justification)) lines.push('• Justification: ' + clean(offer.Justification));
+
+  return lines.join('\n');
+}
+
+function buildCashUnderwritingNote(ctx) {
+  var cash = ctx.cashOffer || {};
+  var mao = firstValue(cash.cash_offer, ctx.mao, 0);
+
+  return 'Cash MAO is ' + money(mao, 0) + '. This MAO is based on the ARV cash-offer table and does not automatically deduct estimated repairs, buyer closing costs, seller agent fees, or wholesale fee. Those numbers are displayed as closer reference points only. Repairs should only be deducted from the seller-facing offer if the transcript, agent notes, inspection comments, or listing remarks specifically confirm repair issues. Closing costs, seller agent fees, and wholesale fees are negotiation levers, not automatic deductions from the initial MAO.';
+}
+
+function buildCashOfferSection(ctx) {
+  var updated = ctx.dealStructure['Updated Cash Offer'] || {};
+  var cash = ctx.cashOffer || {};
+  var lines = [];
+
+  lines.push('💵 All Cash Offer');
+
+  pushLine(lines, 'Final Cash Offer / MAO', firstValue(updated['Final Cash Offer'], cash.cash_offer, ctx.mao), function(v) {
+    if (typeof v === 'string' && v.indexOf('$') >= 0) return v;
+    return money(v, 0);
+  });
+
+  pushLine(lines, 'Final Cash Offer % of ARV', firstValue(updated['Final Cash Offer % of ARV'], cash.cash_offer_pct_of_arv));
+  pushLine(lines, 'Cash Offer Table Used', firstValue(updated['Cash Offer Table Used'], cash.cash_offer_table));
+  pushLine(lines, 'ARV', cash.arv, function(v) { return money(v, 0); });
+  pushLine(lines, 'Cash Offer % Used', firstValue(cash.cash_offer_pct_used, cash.buy_box_pct));
+  pushLine(lines, 'Base Cash Offer Before Repair Deduction', firstValue(updated['Base Cash Offer Before Repair Deduction'], cash.base_cash_offer_before_repair_deduction), function(v) { return money(v, 0); });
+
+  lines.push('');
+  lines.push('Closer Reference Numbers - Not Automatically Deducted');
+
+  pushLine(lines, 'Repair Estimate Reference', firstValue(cash.repair_estimate, ctx.repairEstimate), function(v) { return money(v, 0); });
+  pushLine(lines, 'Repair Deduction Used In MAO', firstValue(updated['Repair Deduction Used'], cash.repair_deduction_used), function(v) { return money(v, 0); });
+  pushLine(lines, 'Repair Deduction Reason', firstValue(updated['Repair Deduction Reason'], cash.repair_deduction_reason));
+  pushLine(lines, 'Low Rehab Reference', firstValue(updated['Low Rehab Reference'], cash.low_rehab_reference), function(v) { return money(v, 0); });
+  pushLine(lines, 'Medium Rehab Reference', firstValue(updated['Medium Rehab Reference'], cash.medium_rehab_reference), function(v) { return money(v, 0); });
+  pushLine(lines, 'Full Rehab Reference', firstValue(updated['Full Rehab Reference'], cash.full_rehab_reference), function(v) { return money(v, 0); });
+  pushLine(lines, 'Buyer Closing / Acquisition Cost Reference', firstValue(updated['Buyer Acquisition Costs Reference'], cash.buyer_acquisition_costs_reference, cash.buyer_closing_costs), function(v) { return money(v, 0); });
+  pushLine(lines, 'Seller Agent Fee Reference', firstValue(updated['Seller Agent Fee Reference'], cash.seller_agent_fee_reference), function(v) { return money(v, 0); });
+  pushLine(lines, 'Seller Closing Costs Reference', firstValue(updated['Seller Closing Costs Reference'], cash.seller_closing_costs_reference), function(v) { return money(v, 0); });
+  pushLine(lines, 'Wholesale Fee Reference', firstValue(cash.wholesale_fee, ctx.wholesaleFee), function(v) { return money(v, 0); });
+  pushLine(lines, 'Spread vs List Price', cash.spread_vs_list_price, function(v) { return money(v, 0); });
+  pushLine(lines, 'Deal Viable', cash.deal_viable);
+
+  lines.push('');
+  lines.push('• Underwriting Note: ' + buildCashUnderwritingNote(ctx));
+
+  if (isPresent(updated.Justification)) lines.push('• Engine Note: ' + clean(updated.Justification));
+
+  return lines.join('\n');
+}
+
+function buildCtsEngineSection(ctx) {
+  var c = ctx.ctsEngine || {};
+  if (!hasAnyKey(c, ['seller_retail_net', 'recommended_cts'])) return null;
+
+  var lines = [];
+  lines.push('🧭 CTS Engine');
+  pushLine(lines, 'Seller Retail Net', c.seller_retail_net, function(v) { return money(v, 0); });
+  pushLine(lines, 'Agent Commission', c.agent_commission, function(v) { return money(v, 0); });
+  pushLine(lines, 'Seller Closing Costs', c.seller_closing_costs, function(v) { return money(v, 0); });
+  pushLine(lines, 'CTS Conservative', c.cts_conservative, function(v) { return money(v, 0); });
+  pushLine(lines, 'CTS Standard', c.cts_standard, function(v) { return money(v, 0); });
+  pushLine(lines, 'CTS Aggressive', c.cts_aggressive, function(v) { return money(v, 0); });
+  pushLine(lines, 'Recommended CTS', c.recommended_cts, function(v) { return money(v, 0); });
+  pushLine(lines, 'Motivation Bracket', c.motivation_bracket);
+  pushLine(lines, 'Hard Cap 15%', c.hard_cap_15pct, function(v) { return money(v, 0); });
+
+  if (isPresent(ctx.assignmentFeeRange)) lines.push('• Assignment Fee Range: ' + ctx.assignmentFeeRange);
+
+  return lines.join('\n');
+}
+
+function buildCompsSection(ctx) {
+  var comps = Array.isArray(ctx.compPropertiesReport) ? ctx.compPropertiesReport.slice(0, 5) : [];
+  var lines = [];
+
+  lines.push('📌 Comps');
+
+  if (isPresent(ctx.compsSummary)) lines.push('• Summary: ' + clean(ctx.compsSummary));
+
+  if (!comps.length) {
+    lines.push('• —');
+    return lines.join('\n');
+  }
+
+  comps.forEach(function(c, i) {
+    var bits = [];
+    bits.push(c.address || '—');
+
+    if (isPresent(c.price)) bits.push(money(c.price, 0));
+    if (isPresent(c.beds) || isPresent(c.bedrooms)) bits.push(firstValue(c.beds, c.bedrooms) + 'bd');
+    if (isPresent(c.baths) || isPresent(c.bathrooms)) bits.push(firstValue(c.baths, c.bathrooms) + 'ba');
+    if (isPresent(c.squareFootage)) bits.push(c.squareFootage + ' sf');
+    if (isPresent(c.daysOnMarket)) bits.push('DOM ' + c.daysOnMarket);
+    if (isPresent(c.distance)) bits.push('Dist ' + c.distance);
+    if (isPresent(c.correlation)) bits.push('Corr ' + c.correlation);
+
+    lines.push('• Comp ' + (i + 1) + ': ' + bits.join(', '));
+  });
+
+  return lines.join('\n');
+}
+
+function buildBuyerMatchesSection(ctx, showContact) {
+  var buyers = Array.isArray(ctx.buyerMatches) ? ctx.buyerMatches.slice(0, 5) : [];
+  var lines = [];
+
+  lines.push('👤 Buyer Matches');
+
+  if (isPresent(ctx.buyerMatchSummary)) lines.push('• Summary: ' + clean(ctx.buyerMatchSummary));
+
+  if (!buyers.length) {
+    lines.push('• —');
+    return lines.join('\n');
+  }
+
+  buyers.forEach(function(b) {
+    var head = (b.buyer || '—') + ' (' + (b.score != null ? b.score : '—') + ') [' + (b.level || '—') + ']' + (b.rationale ? ' — ' + b.rationale : '');
+    lines.push('• ' + head);
+
+    if (showContact) {
+      var contact = b.contact || {};
+      var parts = [];
+
+      if (isPresent(contact.name)) parts.push(contact.name);
+      if (isPresent(contact.company)) parts.push(contact.company);
+      if (isPresent(contact.email)) parts.push(contact.email);
+      if (isPresent(contact.phone)) parts.push(String(contact.phone));
+
+      if (parts.length) lines.push('•   Contact: ' + parts.join(' | '));
+    }
+  });
+
+  return lines.join('\n');
+}
+
+function buildDispoSection(ctx) {
+  var d = ctx.dispoStrategy || {};
+  if (!hasAnyKey(d, ['recommendedDispoStrategy', 'bestEndBuyerType', 'projectedAssignmentFee'])) return null;
+
+  var lines = [];
+  lines.push('🧭 Disposition Strategy');
+
+  pushLine(lines, 'Recommended Strategy', d.recommendedDispoStrategy);
+  pushLine(lines, 'Best End Buyer Type', d.bestEndBuyerType);
+  pushLine(lines, 'Projected Assignment Fee', d.projectedAssignmentFee);
+
+  if (Array.isArray(d.endBuyerExitStrategyProfitProjections) && d.endBuyerExitStrategyProfitProjections.length) {
+    lines.push('• End Buyer Exit Strategy Profit Projections:');
+    d.endBuyerExitStrategyProfitProjections.forEach(function(x) {
+      lines.push('•   • ' + x);
+    });
+  }
+
+  return lines.join('\n');
+}
+
+function buildRecommendationsSection(ctx) {
+  if (!isPresent(ctx.finalRecommendationsAndInsights)) return null;
+  return '📬 Final Recommendations and Insights\n• ' + clean(ctx.finalRecommendationsAndInsights);
+}
+
+function buildTranscriptSection(ctx) {
+  var t = firstValue(ctx.transcript && ctx.transcript.output, ctx.transcript, {});
+  if (!hasAnyKey(t, ['sellerUrgency', 'sellerHardship', 'conditionOfProperty', 'price', 'additionalInsights'])) return null;
+
+  var lines = [];
+  lines.push('🗒️ Transcript Insights');
+  pushLine(lines, 'Seller Urgency', t.sellerUrgency);
+  pushLine(lines, 'Seller Hardship', t.sellerHardship);
+  pushLine(lines, 'Condition', t.conditionOfProperty);
+  pushLine(lines, 'Price / Terms', t.price);
+  pushLine(lines, 'Additional', t.additionalInsights);
+
+  return lines.join('\n');
+}
+
+function buildLeadSection(ctx) {
+  return buildAcceptanceScoringText(ctx);
+}
+
+function buildLoanSection(ctx) {
+  var ex = ctx.existingLoan || {};
+  if (!hasAnyKey(ex, ['balance', 'rate', 'sellerMonthlyPaymentPI', 'original_principal', 'ltv'])) return null;
+
+  var lines = [];
+  lines.push('🏦 Existing Loan');
+
+  pushLine(lines, 'Balance', ex.balance, function(v) { return money(v, 0); });
+  pushLine(lines, 'Rate', ex.rate, function(v) { return pct(v, 2); });
+  pushLine(lines, 'Monthly PI', ex.sellerMonthlyPaymentPI, function(v) { return money(v, 2); });
+  pushLine(lines, 'Original Principal', ex.original_principal, function(v) { return money(v, 0); });
+  pushLine(lines, 'LTV', ex.ltv, function(v) { return pct(Number(v) <= 1.5 ? Number(v) * 100 : v, 2); });
+
+  return lines.join('\n');
+}
+
+function buildOffersSection(ctx, includeCtsEngine) {
+  var sections = [];
+
+  sections.push('💼 Deal Structure');
+  sections.push(buildOfferSection('Primary Offer', ctx.dealStructure['Primary Offer']));
+  sections.push(buildOfferSection('Backup Offer', ctx.dealStructure['Backup Offer']));
+  sections.push(buildCashOfferSection(ctx));
+
+  if (includeCtsEngine) {
+    var cts = buildCtsEngineSection(ctx);
+    if (cts) sections.push(cts);
+  }
+
+  return sections.join('\n\n');
+}
+
+function buildCloserCashReferenceChecklist(ctx) {
+  return [
+    '💵 Cash MAO Interpretation',
+    '• ' + buildCashUnderwritingNote(ctx),
+    '• Do not reduce the initial cash offer just because reference repairs or fees are shown.',
+    '• Use repair references only if the seller/agent/listing confirms actual condition issues.',
+    '• Use closing costs, seller agent fee, and wholesale fee as negotiation context, not automatic deductions.'
+  ].join('\n');
+}
+
+function buildPrequalifier(ctx) {
+  return [
+    buildHeader(ctx),
+    buildLeadSection(ctx),
+    buildInvestorsAnalysis(ctx),
+    buildOffersSection(ctx, false),
+    buildCompsSection(ctx),
+    buildBuyerMatchesSection(ctx, false),
+    buildTranscriptSection(ctx)
+  ].filter(Boolean).join('\n\n');
+}
+
+function buildCloser(ctx) {
+  return [
+    buildHeader(ctx),
+    buildLoanSection(ctx),
+    buildLeadSection(ctx),
+    buildInvestorsAnalysis(ctx),
+    buildOffersSection(ctx, true),
+    buildCloserCashReferenceChecklist(ctx),
+    buildDispoSection(ctx),
+    buildCompsSection(ctx),
+    buildBuyerMatchesSection(ctx, false),
+    buildRecommendationsSection(ctx),
+    '🧰 Closer Checklist\n' + [
+      '• Verify payoff, PI, escrow, arrears, HOA, liens, solar, and any loss-mit status',
+      '• Reconfirm CTS / cash to seller and who is covering closing costs',
+      '• Reconfirm move-out timing and title / attorney / escrow path',
+      '• Use the AI justification as the narrative and the OFFER ENGINE numbers as the hard math',
+      '• Cash MAO excludes unconfirmed repairs and excludes closing costs unless closer chooses to negotiate them in'
+    ].join('\n')
+  ].filter(Boolean).join('\n\n');
+}
+
+function buildTC(ctx) {
+  return [
+    buildHeader(ctx),
+    buildLeadSection(ctx),
+    buildLoanSection(ctx),
+    buildInvestorsAnalysis(ctx),
+    buildOffersSection(ctx, true),
+    buildCloserCashReferenceChecklist(ctx),
+    buildCompsSection(ctx),
+    buildBuyerMatchesSection(ctx, true),
+    buildRecommendationsSection(ctx)
+  ].filter(Boolean).join('\n\n');
+}
+
+function buildDispoManager(ctx) {
+  return [
+    buildHeader(ctx),
+    buildLeadSection(ctx),
+    buildLoanSection(ctx),
+    buildInvestorsAnalysis(ctx),
+    buildOffersSection(ctx, true),
+    buildCloserCashReferenceChecklist(ctx),
+    buildDispoSection(ctx),
+    buildCompsSection(ctx),
+    buildBuyerMatchesSection(ctx, true),
+    buildRecommendationsSection(ctx)
+  ].filter(Boolean).join('\n\n');
+}
+
+function buildOwner(ctx) {
+  return [
+    buildHeader(ctx),
+    buildLeadSection(ctx),
+    buildLoanSection(ctx),
+    buildInvestorsAnalysis(ctx),
+    buildOffersSection(ctx, true),
+    buildCloserCashReferenceChecklist(ctx),
+    buildDispoSection(ctx),
+    buildCompsSection(ctx),
+    buildBuyerMatchesSection(ctx, true),
+    buildRecommendationsSection(ctx)
+  ].filter(Boolean).join('\n\n');
+}
+
+function buildOwnerHtml(ctx) {
+  var bodyText = [
+    buildLoanSection(ctx),
+    buildInvestorsAnalysis(ctx),
+    buildOffersSection(ctx, true),
+    buildCloserCashReferenceChecklist(ctx),
+    buildDispoSection(ctx),
+    buildCompsSection(ctx),
+    buildBuyerMatchesSection(ctx, true),
+    buildRecommendationsSection(ctx)
+  ].filter(Boolean).join('\n\n');
+
+  return [
+    buildHeaderHtml(ctx),
+    buildAcceptanceScoringHtml(ctx),
+    '<div style="font-family:Arial,Helvetica,sans-serif;border:1px solid #dbe3ef;border-radius:16px;background:#ffffff;padding:16px 18px;margin-top:16px;color:#0f172a;font-size:13px;line-height:1.45;">' + nlToBr(bodyText) + '</div>'
+  ].filter(Boolean).join('\n');
+}
+
+function buildEndBuyer(ctx) {
+  return [
+    buildHeader(ctx),
+    buildLeadSection(ctx),
+    buildInvestorsAnalysis(ctx),
+    buildOfferSection('Primary Offer', ctx.dealStructure['Primary Offer']),
+    buildCashOfferSection(ctx),
+    buildCompsSection(ctx),
+    buildDispoSection(ctx)
+  ].filter(Boolean).join('\n\n');
+}
+
+function buildRoleNotes(ctx) {
+  var notes = {
+    prequalifier: buildPrequalifier(ctx),
+    closer: buildCloser(ctx),
+    tc: buildTC(ctx),
+    dispo_manager: buildDispoManager(ctx),
+    owner: buildOwner(ctx),
+    end_buyer: buildEndBuyer(ctx)
+  };
+
+  var out = {};
+
+  Object.keys(notes).forEach(function(key) {
+    out[key] = {
+      text: notes[key],
+      html: key === 'owner' ? buildOwnerHtml(ctx) : nlToBr(notes[key]),
+      discord: toDiscord(notes[key])
+    };
+  });
+
+  return out;
+}
+
+function buildFallbackLoi(ctx) {
+  var p = ctx.property || {};
+  var addr = [p.address, p.city, p.state, p.postal_code].filter(Boolean).join(', ') || 'the subject property';
+  var primary = ctx.dealStructure['Primary Offer'] || {};
+  var cash = ctx.dealStructure['Updated Cash Offer'] || {};
+
+  return [
+    '<html><body>',
+    '<h2>Letter of Intent - ' + escapeHtml(addr) + '</h2>',
+    '<p>Please consider the following purchase options:</p>',
+    '<h3>Option 1: All Cash</h3>',
+    '<p>Purchase Price: ' + escapeHtml(firstValue(cash['Final Cash Offer'], '—')) + '</p>',
+    '<h3>Option 2: Creative Offer</h3>',
+    '<p>Type: ' + escapeHtml(firstValue(primary.Type, primary.offer_type, '—')) + '</p>',
+    '<p>Purchase Price: ' + escapeHtml(firstValue(primary['Purchase Price'], '—')) + '</p>',
+    '<p>Cash to Seller / CTS: ' + escapeHtml(firstValue(primary.cts, primary['CTS ($)'], primary['Cash to Seller'], primary['Down Payment ($)'], '—')) + '</p>',
+    '<p>Justification: ' + escapeHtml(clean(primary.Justification || '') || '—') + '</p>',
+    '</body></html>'
+  ].join('');
+}
+
+function buildOutput(a) {
+  var ctx = buildContext(a);
+  var role_notes = buildRoleNotes(ctx);
+  var ownerOneLine = role_notes.owner.text.replace(/\n+/g, ' | ').replace(/\s+/g, ' ').trim();
+
+  return {
+    role_notes: role_notes,
+    pretty_summary_one_line: ownerOneLine,
+    pretty_json: JSON.stringify(a, null, 2),
+
+    ai_underwriting_note: role_notes.owner.html,
+    pretty_note_ghl: role_notes.owner.text,
+
+    direct_to_agent_loi: firstValue(ctx.loi, buildFallbackLoi(ctx))
+  };
+}
+
+if (typeof item !== 'undefined') {
+  return [{ json: buildOutput(item && item.json ? item.json : {}) }];
+}
+
+var allItems = (typeof items !== 'undefined') ? items : $input.all();
+
+return allItems.map(function(it) {
+  return { json: buildOutput(it && it.json ? it.json : {}) };
+});
